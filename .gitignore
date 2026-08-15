@@ -2,6 +2,3 @@
 .vscode
 .private
 platformio_custom.ini
-src/main*.cpp
-src/main*.h
-src/madflight_config.h
