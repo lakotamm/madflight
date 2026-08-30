@@ -36,6 +36,7 @@ pin_imu_int   27
 pin_imu_clkin 26
 imu_i2c_bus   -1
 imu_i2c_adr   0
+imu_rate      800
 
 // IMPORTANT: the IMU sensor should be the ONLY sensor on the selected bus
 

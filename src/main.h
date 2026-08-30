@@ -1,8 +1,5 @@
 #pragma once
-
-void wind_task(void *pvParameters);
  
-void wind_task_start();
 
 /*========================================================================================================================
                                               MADFLIGHT CONFIG
