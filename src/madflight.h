@@ -65,7 +65,7 @@ void cli_task(void *pvParameters) {
   for(;;) {
     cli.update(); // process CLI commands
 
-    portYIELD();
+    vTaskDelay(1);
   }
 }
 

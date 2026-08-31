@@ -14,7 +14,6 @@ void wind_task(void *pvParameters);
 void wind_task_start();
 
 ScheduleFreq wind_print_schedule = ScheduleFreq(5); //scheduled sensor print to 5Hz
-TaskHandle_t wind_task_handle = NULL; //so imu_loop() can notify wind_task directly
 
 // Shared dt diagnostics - simple scalars, read/reset from loop() without a lock.
 // Each is independently valid even under a rare torn read (same tolerance the
@@ -70,12 +69,6 @@ void imu_loop() {
 
   // AHRS sensor fusion - type 'pahr' in CLI to see results
   ahr.update();
-
-  // Wake wind_task now that fresh orientation is published - replaces polling
-  // with an event-driven wake, tightly aligning pressure reads to IMU updates.
-  if (wind_task_handle != NULL) {
-    xTaskNotifyGive(wind_task_handle);
-  }
 }
 
 //=====================================================================
@@ -87,13 +80,13 @@ void imu_loop() {
 void wind_task(void *pvParameters) {
   (void)pvParameters;
 
-  for (;;) {
-    // Block here - zero CPU used - until imu_loop() notifies us. This
-    // naturally runs wind_task at the IMU's real rate (800Hz on this
-    // ICM-45686 config, not 1000Hz - matches your earlier finding), one
-    // read cycle per IMU update, with no polling or tick-granularity slop.
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  // vTaskDelayUntil() targets an absolute future tick, not "now + period" -
+  // this is what actually fixed the jitter, not the busy-poll/notification
+  // schemes tried earlier. See surrounding discussion for why.
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(1); //1000Hz target
 
+  for (;;) {
     wind.update(); //reads + publishes to wind.topic - no Serial I/O here, ever
 
     //accumulate dt stats only - no printing in this task
@@ -101,13 +94,11 @@ void wind_task(void *pvParameters) {
     if (wind.dt > wind_dt_max) wind_dt_max = wind.dt;
     wind_dt_sum += wind.dt;
     wind_dt_count++;
+
+    vTaskDelayUntil(&lastWakeTime, period);
   }
 }
 
 void wind_task_start() {
-  // Safe to run at elevated priority now: this task spends essentially all
-  // its time genuinely blocked in ulTaskNotifyTake(), not busy-polling, so
-  // it can never starve mf_SENSOR or loop() the way the earlier busy-loop
-  // + priority+1 combination did.
-  hal_xTaskCreate(wind_task, "mf_WIND", MF_FREERTOS_DEFAULT_STACK_SIZE, NULL, uxTaskPriorityGet(NULL) + 1, &wind_task_handle, 0);
+  hal_xTaskCreate(wind_task, "mf_WIND", MF_FREERTOS_DEFAULT_STACK_SIZE, NULL, uxTaskPriorityGet(NULL) + 1, NULL, 0);
 }
