@@ -39,7 +39,7 @@ void setup() {
 
 void loop() {
   // Printing lives here, not in wind_task - Serial I/O can block for a few ms
-  // without touching the 1000Hz read loop, since this runs as its own thing.
+  // without touching the 500Hz read loop, since this runs as its own thing.
   if (wind_print_schedule.expired()) {
     WindState w;
     if (wind.topic.pull_latest(&w)) {
@@ -64,8 +64,8 @@ void loop() {
 
 // This function is called from the IMU task when fresh IMU data is available.
 void imu_loop() {
-  // Toggle led on every 1000 samples (E.g. 1 second period at 1000Hz sample rate)
-  if(imu.update_cnt % 1000 == 0) led.toggle();
+  // Toggle led on every 800 samples (E.g. 1 second period at 800Hz sample rate)
+  if(imu.update_cnt % 800 == 0) led.toggle();
 
   // AHRS sensor fusion - type 'pahr' in CLI to see results
   ahr.update();
@@ -84,7 +84,7 @@ void wind_task(void *pvParameters) {
   // this is what actually fixed the jitter, not the busy-poll/notification
   // schemes tried earlier. See surrounding discussion for why.
   TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(1); //1000Hz target
+  const TickType_t period = pdMS_TO_TICKS(2); //500Hz target
 
   for (;;) {
     wind.update(); //reads + publishes to wind.topic - no Serial I/O here, ever
