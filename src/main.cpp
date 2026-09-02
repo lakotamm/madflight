@@ -13,7 +13,7 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 void wind_task(void *pvParameters);
 void wind_task_start();
 
-ScheduleFreq wind_print_schedule = ScheduleFreq(5); //scheduled sensor print to 5Hz
+ScheduleFreq wind_print_schedule = ScheduleFreq(10); //scheduled sensor print to 10Hz
 
 // Shared dt diagnostics - simple scalars, read/reset from loop() without a lock.
 // Each is independently valid even under a rare torn read (same tolerance the
@@ -57,9 +57,11 @@ void loop() {
         w.leftright.dp, w.leftright.valid ? "ok" : "FAIL",
         dt_min, dt_avg, dt_max, (unsigned long)dt_count
       );
+
+      Serial.printf("AHR Accel in earth frame %7.2f \n", ahr.getAccelUp());
     }
   }
-  delay(20); //cheap idle - print schedule (5Hz) still governs actual output rate
+  vTaskDelay(20); //cheap idle - print schedule (5Hz) still governs actual output rate
 }
 
 // This function is called from the IMU task when fresh IMU data is available.
