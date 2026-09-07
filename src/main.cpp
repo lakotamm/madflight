@@ -13,7 +13,8 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 void wind_task(void *pvParameters);
 void wind_task_start();
 
-ScheduleFreq wind_print_schedule = ScheduleFreq(10); //scheduled sensor print to 10Hz
+float avg_speed_up = 0 ;
+uint32_t speed_up_count = 0;
 
 // Shared dt diagnostics - simple scalars, read/reset from loop() without a lock.
 // Each is independently valid even under a rare torn read (same tolerance the
@@ -35,33 +36,46 @@ void setup() {
   wind_task_start();
 
   Serial.println("Setup completed, CLI started - Type 'help' for help, or 'diff' to debug");
+  avg_speed_up = 0;
 }
 
 void loop() {
   // Printing lives here, not in wind_task - Serial I/O can block for a few ms
   // without touching the 500Hz read loop, since this runs as its own thing.
-  if (wind_print_schedule.expired()) {
-    WindState w;
-    if (wind.topic.pull_latest(&w)) {
-      //snapshot + reset the dt stats (simple scalars, no lock needed - see wind_task)
-      float dt_min = wind_dt_min, dt_max = wind_dt_max, dt_sum = wind_dt_sum;
-      uint32_t dt_count = wind_dt_count;
-      wind_dt_min = 1e9f; wind_dt_max = 0; wind_dt_sum = 0; wind_dt_count = 0;
-      float dt_avg = (dt_count > 0) ? (dt_sum / dt_count) : 0;
 
-      Serial.printf(
-        "[WIND] center dp=%7.2fPa t=%5.1fC (%s)  topbot dp=%7.2fPa (%s)  leftright dp=%7.2fPa (%s)  "
-        "dt min/avg/max=%.4f/%.4f/%.4f n=%lu\n",
-        w.center.dp, w.center.temp, w.center.valid ? "ok" : "FAIL",
-        w.topbot.dp, w.topbot.valid ? "ok" : "FAIL",
-        w.leftright.dp, w.leftright.valid ? "ok" : "FAIL",
-        dt_min, dt_avg, dt_max, (unsigned long)dt_count
-      );
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(10); //100Hz target
 
-      Serial.printf("AHR Accel in earth frame %7.2f \n", ahr.getAccelUp());
-    }
+  float speed_up = alt.getV();
+
+  avg_speed_up += speed_up;
+  speed_up_count++;
+
+
+  if(speed_up_count >= 10) {
+  Serial.printf("ALT VSpeed %7.2f \n", avg_speed_up/speed_up_count);
+  avg_speed_up = 0;
+  speed_up_count = 0;
   }
-  vTaskDelay(20); //cheap idle - print schedule (5Hz) still governs actual output rate
+  /*
+   WindState w;
+   if (wind.topic.pull_latest(&w)) {
+     //snapshot + reset the dt stats (simple scalars, no lock needed - see wind_task)
+     float dt_min = wind_dt_min, dt_max = wind_dt_max, dt_sum = wind_dt_sum;
+     uint32_t dt_count = wind_dt_count;
+     wind_dt_min = 1e9f; wind_dt_max = 0; wind_dt_sum = 0; wind_dt_count = 0;
+     float dt_avg = (dt_count > 0) ? (dt_sum / dt_count) : 0;
+     Serial.printf(
+       "[WIND] center dp=%7.2fPa t=%5.1fC (%s)  topbot dp=%7.2fPa (%s)  leftright dp=%7.2fPa (%s)  "
+       "dt min/avg/max=%.4f/%.4f/%.4f n=%lu\n",
+       w.center.dp, w.center.temp, w.center.valid ? "ok" : "FAIL",
+       w.topbot.dp, w.topbot.valid ? "ok" : "FAIL",
+       w.leftright.dp, w.leftright.valid ? "ok" : "FAIL",
+       dt_min, dt_avg, dt_max, (unsigned long)dt_count
+     );
+  }
+*/
+  vTaskDelayUntil(&lastWakeTime, period);
 }
 
 // This function is called from the IMU task when fresh IMU data is available.
