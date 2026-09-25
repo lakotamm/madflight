@@ -38,6 +38,11 @@ imu_i2c_bus   -1
 imu_i2c_adr   0
 imu_rate      800
 
+// Disabling filtering because of VQF filter, which is more accurate
+imu_gyr_lp    1e10
+imu_acc_lp    1e10
+mag_lp        1e10
+
 // IMPORTANT: the IMU sensor should be the ONLY sensor on the selected bus
 
 //--- BAR --- Barometer
@@ -74,7 +79,7 @@ led_gizmo     RGB // options: NONE, HIGH_IS_ON, LOW_IS_ON, RGB
 pin_led       46
 
 //--- AHR --- AHRS (keep MAHONY, unless you want to experiment)
-ahr_gizmo     MAHONY  // options: MAHONY, MAHONY_BF, MADGWICK, VQF
+ahr_gizmo     VQF  // options: MAHONY, MAHONY_BF, MADGWICK, VQF
 
 //--- Serial bus 0 ---
 pin_ser0_rx   1

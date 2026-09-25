@@ -46,7 +46,9 @@ void loop() {
   TickType_t lastWakeTime = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(10); //100Hz target
 
-  float speed_up = alt.getV();
+ /*
+ // Printing of vertical speed
+ float speed_up = alt.getV();
 
   avg_speed_up += speed_up;
   speed_up_count++;
@@ -57,7 +59,12 @@ void loop() {
   avg_speed_up = 0;
   speed_up_count = 0;
   }
+
+  */
+
+
   /*
+  //printing of wind sensors
    WindState w;
    if (wind.topic.pull_latest(&w)) {
      //snapshot + reset the dt stats (simple scalars, no lock needed - see wind_task)
