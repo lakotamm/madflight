@@ -81,13 +81,18 @@ pin_led       46
 //--- AHR --- AHRS (keep MAHONY, unless you want to experiment)
 ahr_gizmo     VQF  // options: MAHONY, MAHONY_BF, MADGWICK, VQF
 
+//--- GPS --- UBLOX DAN-F10N
+gps_baud      115200
+gps_gizmo     UBLOX
+gps_ser_bus   0
+
 //--- Serial bus 0 ---
-pin_ser0_rx   1
-pin_ser0_tx   0
+pin_ser0_rx   13
+pin_ser0_tx   12
 
 //--- Serial bus 1 ---
-pin_ser1_rx   21
-pin_ser1_tx   20 
+pin_ser1_rx   25
+pin_ser1_tx   24 
 
 //--- SPI bus 0 ---
 pin_spi0_miso -1
