@@ -45,6 +45,7 @@ public:
 
 private:
   uart_inst_t* uart_ = nullptr;
+  uint8_t uart_num_ = 0;
 
 #if PICO_RP2040
   int8_t rx_ctrl_dma_ch = -1;

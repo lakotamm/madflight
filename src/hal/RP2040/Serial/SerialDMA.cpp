@@ -37,6 +37,7 @@ SOFTWARE.
 
 
 uint32_t SerialDMA::begin(uint8_t uart_num, uint32_t baudrate, int txpin, int rxpin, uint16_t txbuflen, uint16_t rxbuflen, uint8_t bits, char parity, uint8_t stop, bool invert) {
+  uart_num_ = uart_num;
   uart_ = UART_INSTANCE(uart_num);
   gpio_set_function(txpin, GPIO_FUNC_UART);
   gpio_set_function(rxpin, GPIO_FUNC_UART);
@@ -82,6 +83,15 @@ uint32_t SerialDMA::setBaud(uint32_t baudrate) {
 }
 
 void SerialDMA::init_dma() {
+// Select the DMA request sources and data register for this UART.
+  const uint rx_dreq =
+      (uart_num_ == 0) ? DREQ_UART0_RX : DREQ_UART1_RX;
+
+  const uint tx_dreq =
+      (uart_num_ == 0) ? DREQ_UART0_TX : DREQ_UART1_TX;
+
+  volatile void *uart_dr = (volatile void *)&uart_get_hw(uart_)->dr;
+
 #if PICO_RP2040
   // RP2040 does not have self trigger, use second dma channel to re-trigger rx channel
   // DMA uart read
@@ -103,10 +113,10 @@ void SerialDMA::init_dma() {
   channel_config_set_read_increment(&rx_config, false);
   channel_config_set_write_increment(&rx_config, true);
   channel_config_set_ring(&rx_config, true, rx_buf_len_pow);  //true = write buffer
-  channel_config_set_dreq(&rx_config, DREQ_UART0_RX);
+  channel_config_set_dreq(&rx_config, rx_dreq);
   channel_config_set_chain_to(&rx_config, rx_ctrl_dma_ch);
   channel_config_set_enable(&rx_config, true);
-  dma_channel_configure(rx_dma_ch, &rx_config, rx_buf, &uart0_hw->dr, rx_buf_len << 16, true); // note: rx_buf_len<<16 to fill buffer 65356 times before chaining to ctrl_ch (remove <<16 to test chaining)
+  dma_channel_configure(rx_dma_ch, &rx_config, rx_buf, uart_dr, rx_buf_len << 16, true); // note: rx_buf_len<<16 to fill buffer 65356 times before chaining to ctrl_ch (remove <<16 to test chaining)
 #else
   // RP2350 has self trigger
   // DMA uart read
@@ -116,9 +126,9 @@ void SerialDMA::init_dma() {
   channel_config_set_read_increment(&rx_config, false);
   channel_config_set_write_increment(&rx_config, true);
   channel_config_set_ring(&rx_config, true, rx_buf_len_pow);  //true = write buffer
-  channel_config_set_dreq(&rx_config, DREQ_UART0_RX);
+  channel_config_set_dreq(&rx_config, rx_dreq);
   channel_config_set_enable(&rx_config, true);
-  dma_channel_configure(rx_dma_ch, &rx_config, rx_buf, &uart0_hw->dr, dma_encode_transfer_count_with_self_trigger(rx_buf_len), true);
+  dma_channel_configure(rx_dma_ch, &rx_config, rx_buf, uart_dr, dma_encode_transfer_count_with_self_trigger(rx_buf_len), true);
   dma_channel_set_irq0_enabled(rx_dma_ch, false);
 #endif
 
@@ -129,9 +139,9 @@ void SerialDMA::init_dma() {
   channel_config_set_read_increment(&tx_config, true);
   channel_config_set_write_increment(&tx_config, false);
   channel_config_set_ring(&tx_config, false, tx_buf_len_pow); //false = read buffer
-  channel_config_set_dreq(&tx_config, DREQ_UART0_TX);
+  channel_config_set_dreq(&tx_config, tx_dreq);
   dma_channel_set_config(tx_dma_ch, &tx_config, false);
-  dma_channel_set_write_addr(tx_dma_ch, &uart0_hw->dr, false);
+  dma_channel_set_write_addr(tx_dma_ch, uart_dr, false);
 }
 
 uint16_t SerialDMA::availableForWrite() {
@@ -149,12 +159,17 @@ uint16_t SerialDMA::write(const uint8_t* data, uint16_t length) {
   }
 
   //copy to dma buffer
-  if ((tx_buf_len - 1) < tx_user_idx + length) {
-    memcpy(&tx_buf[tx_user_idx], data, tx_buf_len - tx_user_idx);
-    memcpy(tx_buf, &data[tx_buf_len - tx_user_idx], length - (tx_buf_len - tx_user_idx));
-  } else {
-    memcpy(&tx_buf[tx_user_idx], data, length);
+  const uint16_t first = (length < (tx_buf_len - tx_user_idx))
+                           ? length
+                           : (tx_buf_len - tx_user_idx);
+
+  memcpy(&tx_buf[tx_user_idx], data, first);
+
+  const uint16_t second = length - first;
+  if (second > 0) {
+    memcpy(tx_buf, data + first, second);
   }
+
   tx_user_idx = (tx_user_idx + length) & (tx_buf_len - 1);
 
   //check if busy
@@ -185,14 +200,16 @@ uint16_t SerialDMA::write(const uint8_t* data, uint16_t length) {
 }
 
 uint16_t SerialDMA::available() {
-  //update buffer tail
-  uint16_t rx_dma_idx = (rx_buf_len - dma_channel_hw_addr(rx_dma_ch)->transfer_count) & (rx_buf_len - 1);
-  
+  rx_dma_idx =
+      (rx_buf_len -
+       dma_channel_hw_addr(rx_dma_ch)->transfer_count)
+      & (rx_buf_len - 1);
+
   if (rx_user_idx <= rx_dma_idx) {
     return rx_dma_idx - rx_user_idx;
-  }else{
-    return tx_buf_len + rx_dma_idx - rx_user_idx;
   }
+
+  return rx_buf_len + rx_dma_idx - rx_user_idx;
 }
 
 uint16_t SerialDMA::read(uint8_t* data, uint16_t length) {
@@ -201,23 +218,31 @@ uint16_t SerialDMA::read(uint8_t* data, uint16_t length) {
   }
 
   uint16_t avail = available();
+
   if (avail < length) {
-    // read as much as we have
     length = avail;
+  }
+
+  if (length == 0) {
+    return 0;
   }
 
   if (rx_user_idx < rx_dma_idx) {
     memcpy(data, &rx_buf[rx_user_idx], length);
   } else {
     uint16_t left = rx_buf_len - rx_user_idx;
+
     if (length < left) {
-      left = length; // limit to target buffer size
+      left = length;
     }
+
     memcpy(data, &rx_buf[rx_user_idx], left);
+
     if (left < length) {
       memcpy(&data[left], rx_buf, length - left);
     }
   }
+
   rx_user_idx = (rx_user_idx + length) & (rx_buf_len - 1);
 
   return length;

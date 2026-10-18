@@ -41,9 +41,14 @@ public:
     
     // The following values work substantially better for altitude estimation for a BMP280/MPU6500 combo
     // resulting in vertical speeds noise within 0.3 m/s, compared to ~2m/s.
-    float altCov = 40;   
+    //float altCov = 40;   
+    //float accCov = 0.05;  
+    //float biasCov = 0.0005; 
+
+    //testing for Vario
+    float altCov = 50;   
     float accCov = 0.05;  
-    float biasCov = 0.0005; 
+    float biasCov = 0.0001; 
 
     Serial.printf("ALT: KALMAN3  altCov=%f accCov=%f biasCov=%f\n", altCov, accCov, biasCov);
 
