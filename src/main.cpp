@@ -46,7 +46,7 @@ void loop() {
   // without touching the 500Hz read loop, since this runs as its own thing.
 
   TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(10); //100Hz target
+  const TickType_t period = pdMS_TO_TICKS(100); //100Hz target
 
  /*
  // Printing of vertical speed
@@ -63,7 +63,6 @@ void loop() {
   }
 
   */
-
 
   /*
   //printing of wind sensors
@@ -83,7 +82,7 @@ void loop() {
        dt_min, dt_avg, dt_max, (unsigned long)dt_count
      );
   }
-*/
+  */
   vTaskDelayUntil(&lastWakeTime, period);
 }
 
@@ -105,9 +104,8 @@ void imu_loop() {
 void wind_task(void *pvParameters) {
   (void)pvParameters;
 
-  // vTaskDelayUntil() targets an absolute future tick, not "now + period" -
-  // this is what actually fixed the jitter, not the busy-poll/notification
-  // schemes tried earlier. See surrounding discussion for why.
+  // vTaskDelayUntil() targets an absolute future tick
+
   TickType_t lastWakeTime = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(2); //500Hz target
 
@@ -120,7 +118,15 @@ void wind_task(void *pvParameters) {
     wind_dt_sum += wind.dt;
     wind_dt_count++;
 
-    vTaskDelayUntil(&lastWakeTime, period);
+
+    //If the hardware of the sensor board is alright, the reading should be done in less than 2ms/2ticks. 
+    //However, in case there is some form of a failure, we still need to give other threads time to run
+
+    if(xTaskGetTickCount()- lastWakeTime >=2){
+      vTaskDelay(1); // prioritise giving other threads time to run in case of a failure
+    } else {
+    vTaskDelayUntil(&lastWakeTime, period); // in most cases, run without a delay
+    }
   }
 }
 
