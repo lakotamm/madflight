@@ -66,6 +66,9 @@ private:
   uint16_t tx_user_idx = 0;  // next index to write
   uint16_t tx_dma_idx = 0;  // next index dma will read
   uint16_t tx_dma_size = 0; // size of current dma transfer
+  bool tx_dma_active = false;
+
+  void serviceTx();
 
   void init_dma();
   uint8_t log_2(uint16_t val);

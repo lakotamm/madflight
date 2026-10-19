@@ -133,19 +133,81 @@ void SerialDMA::init_dma() {
 #endif
 
   /// DMA uart write
-  if(tx_dma_ch < 0) tx_dma_ch = dma_claim_unused_channel(true);  
-  dma_channel_config tx_config = dma_channel_get_default_config(tx_dma_ch);
+    if (tx_dma_ch < 0) {
+    tx_dma_ch = dma_claim_unused_channel(true);
+  }
+
+  dma_channel_config tx_config =
+      dma_channel_get_default_config(tx_dma_ch);
+
   channel_config_set_transfer_data_size(&tx_config, DMA_SIZE_8);
   channel_config_set_read_increment(&tx_config, true);
   channel_config_set_write_increment(&tx_config, false);
-  channel_config_set_ring(&tx_config, false, tx_buf_len_pow); //false = read buffer
   channel_config_set_dreq(&tx_config, tx_dreq);
-  dma_channel_set_config(tx_dma_ch, &tx_config, false);
-  dma_channel_set_write_addr(tx_dma_ch, uart_dr, false);
+
+  // Wrap DMA read addresses around the TX ring buffer.
+  channel_config_set_ring(&tx_config, false, tx_buf_len_pow);
+
+  // Configure without starting a transfer.
+  dma_channel_configure(
+      tx_dma_ch,
+      &tx_config,
+      (volatile void *)uart_dr,
+      tx_buf,
+      0,
+      false
+  );
+
+  tx_user_idx = 0;
+  tx_dma_idx = 0;
+  tx_dma_size = 0;
+  tx_dma_active = false;
+}
+
+void SerialDMA::serviceTx() {
+  if (tx_dma_active) {
+    if (dma_channel_is_busy(tx_dma_ch)) {
+      return;
+    }
+
+    // Previous DMA transaction completed.
+    tx_dma_idx =
+        (tx_dma_idx + tx_dma_size) & (tx_buf_len - 1);
+
+    tx_dma_size = 0;
+    tx_dma_active = false;
+  }
+
+  if (tx_user_idx == tx_dma_idx) {
+    return;  // Queue empty
+  }
+
+  // All queued bytes, including bytes across the ring boundary.
+  uint16_t pending =
+      (tx_user_idx + tx_buf_len - tx_dma_idx)
+      & (tx_buf_len - 1);
+
+  tx_dma_size = pending;
+  tx_dma_active = true;
+
+  dma_channel_set_read_addr(
+      tx_dma_ch,
+      &tx_buf[tx_dma_idx],
+      false
+  );
+
+  dma_channel_set_trans_count(
+      tx_dma_ch,
+      pending,
+      true
+  );
 }
 
 uint16_t SerialDMA::availableForWrite() {
-  return tx_buf_len - 1 - dma_channel_hw_addr(tx_dma_ch)->transfer_count;
+  serviceTx();
+
+  return (tx_dma_idx + tx_buf_len - tx_user_idx - 1)
+         & (tx_buf_len - 1);
 }
 
 uint16_t SerialDMA::write(const uint8_t* data, uint16_t length) {
@@ -153,48 +215,34 @@ uint16_t SerialDMA::write(const uint8_t* data, uint16_t length) {
     return 0;
   }
 
-  uint16_t avail = availableForWrite();
+  serviceTx();
+
+  uint16_t avail =
+      (tx_dma_idx + tx_buf_len - tx_user_idx - 1)
+      & (tx_buf_len - 1);
+
   if (length > avail) {
-    return 0; // not enough space to write
+    return 0;
   }
 
-  //copy to dma buffer
-  const uint16_t first = (length < (tx_buf_len - tx_user_idx))
-                           ? length
-                           : (tx_buf_len - tx_user_idx);
+  uint16_t first = length;
+
+  if (first > tx_buf_len - tx_user_idx) {
+    first = tx_buf_len - tx_user_idx;
+  }
 
   memcpy(&tx_buf[tx_user_idx], data, first);
 
-  const uint16_t second = length - first;
+  uint16_t second = length - first;
+
   if (second > 0) {
     memcpy(tx_buf, data + first, second);
   }
 
-  tx_user_idx = (tx_user_idx + length) & (tx_buf_len - 1);
+  tx_user_idx =
+      (tx_user_idx + length) & (tx_buf_len - 1);
 
-  //check if busy
-  dma_channel_hw_t *hw = dma_channel_hw_addr(tx_dma_ch);
-  uint32_t ctrl = hw->al1_ctrl;
-  bool do_abort = false;
-  if(dma_channel_is_busy(tx_dma_ch)) {
-    hw->al1_ctrl = 0; //EN=0 -> pause the current transfer sequence (i.e. BUSY will remain high if already high)
-    do_abort = true;
-  }
-
-  //update tx_dma_size, tx_dma_index
-  uint32_t bytes_remaining = dma_channel_hw_addr(tx_dma_ch)->transfer_count;
-  uint32_t bytes_written = tx_dma_size - bytes_remaining;
-  tx_dma_size = bytes_remaining + length;
-  tx_dma_idx = (tx_dma_idx + bytes_written) & (tx_buf_len - 1);
-
-  //abort if needed
-  if(do_abort) dma_channel_abort(tx_dma_ch);
-
-  // restart tx dma
-  uint8_t* start = &tx_buf[tx_dma_idx];
-  hw->read_addr = (uintptr_t) start;
-  hw->transfer_count = tx_dma_size;
-  hw->ctrl_trig = ctrl;
+  serviceTx();
 
   return length;
 }
