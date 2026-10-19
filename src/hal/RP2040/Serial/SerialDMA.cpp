@@ -32,19 +32,10 @@ SOFTWARE.
 #include <hardware/uart.h>
 #include <hardware/sync.h>
 #include <string.h>
-#include <stdlib.h>
+#include <stdlib.h> //aligned_alloc
 
 #include "SerialDMA.h"
 
-//allocate len bytes aligned to len (len must be power of two). DMA ring wrap REQUIRES this alignment,
-//otherwise the DMA wraps at the wrong address and corrupts memory. Do not rely on aligned_alloc().
-uint8_t* SerialDMA::alloc_aligned(uint16_t len, uint8_t** raw) {
-  uint8_t* p = (uint8_t*)malloc((size_t)len * 2);
-  *raw = p;
-  if(!p) return nullptr;
-  uintptr_t a = ((uintptr_t)p + (len - 1)) & ~((uintptr_t)len - 1);
-  return (uint8_t*)a;
-}
 
 uint32_t SerialDMA::begin(uint8_t uart_num, uint32_t baudrate, int txpin, int rxpin, uint16_t txbuflen, uint16_t rxbuflen, uint8_t bits, char parity, uint8_t stop, bool invert) {
   if(uart_num > 1) return 0;
@@ -56,7 +47,7 @@ uint32_t SerialDMA::begin(uint8_t uart_num, uint32_t baudrate, int txpin, int rx
   uart_num_ = uart_num;
   uart_ = UART_INSTANCE(uart_num);
 
-  //pins (only configure pins that are used)
+  //only configure pins that are used
   if(txpin >= 0) {
     gpio_set_function(txpin, GPIO_FUNC_UART);
     gpio_set_outover(txpin, (invert ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL));
@@ -66,15 +57,15 @@ uint32_t SerialDMA::begin(uint8_t uart_num, uint32_t baudrate, int txpin, int rx
     gpio_set_inover(rxpin, (invert ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL));
   }
 
-  //uart_init is only called here (it resets the peripheral and the format). setBaud() uses uart_set_baudrate().
+  //uart_init resets the peripheral and the format, so only call it here. setBaud() uses uart_set_baudrate().
   uint32_t actual_baud = uart_init(uart_, baudrate);
 
   //properties
   uart_set_format(uart_, bits, stop, (parity=='E' ? UART_PARITY_EVEN : ( parity=='O' ? UART_PARITY_ODD : UART_PARITY_NONE)) );
-  uart_set_hw_flow(uart_, false, false);
-  uart_set_fifo_enabled(uart_, true);
+  uart_set_hw_flow(uart_, false, false); //no hardware flow (is default?)
+  uart_set_fifo_enabled(uart_, true); //enable FIFOs (is default?)
 
-  //buffers: min 4 bytes, max 32768 bytes (uint16_t)
+  //buffers: min 4 bytes (ring size 0 would mean "no wrap"), max 32768 bytes (uint16_t)
   rx_buf_len_pow = log_2(rxbuflen);
   tx_buf_len_pow = log_2(txbuflen);
   if(rx_buf_len_pow < 2) rx_buf_len_pow = 2;
@@ -84,13 +75,15 @@ uint32_t SerialDMA::begin(uint8_t uart_num, uint32_t baudrate, int txpin, int rx
   rx_buf_len = (uint16_t)1 << rx_buf_len_pow;
   tx_buf_len = (uint16_t)1 << tx_buf_len_pow;
 
-  free(rx_raw); rx_raw = nullptr; rx_buf = nullptr;
-  free(tx_raw); tx_raw = nullptr; tx_buf = nullptr;
-  rx_buf = alloc_aligned(rx_buf_len, &rx_raw);
-  tx_buf = alloc_aligned(tx_buf_len, &tx_raw);
-  if(!rx_buf || !tx_buf) {
-    free(rx_raw); rx_raw = nullptr; rx_buf = nullptr;
-    free(tx_raw); tx_raw = nullptr; tx_buf = nullptr;
+  free(rx_buf); rx_buf = nullptr;
+  free(tx_buf); tx_buf = nullptr;
+  rx_buf = (uint8_t*)aligned_alloc(rx_buf_len, rx_buf_len);
+  tx_buf = (uint8_t*)aligned_alloc(tx_buf_len, tx_buf_len);
+
+  //the DMA ring wrap needs buffers aligned to their size, otherwise the DMA wraps at the wrong address
+  if(!rx_buf || !tx_buf || ((uintptr_t)rx_buf & (rx_buf_len - 1)) || ((uintptr_t)tx_buf & (tx_buf_len - 1))) {
+    free(rx_buf); rx_buf = nullptr;
+    free(tx_buf); tx_buf = nullptr;
     return 0;
   }
   memset(rx_buf, 0, rx_buf_len);
@@ -118,7 +111,7 @@ uint32_t SerialDMA::setBaud(uint32_t baudrate) {
 }
 
 void SerialDMA::stop_dma() {
-  //abort running channels (keep them claimed so they can be re-used)
+  //abort running channels (channels stay claimed so they can be re-used)
 #if PICO_RP2040
   if(rx_ctrl_dma_ch >= 0) dma_channel_abort(rx_ctrl_dma_ch); //abort ctrl first, it chains to rx
 #endif
@@ -126,7 +119,6 @@ void SerialDMA::stop_dma() {
   if(tx_dma_ch >= 0) dma_channel_abort(tx_dma_ch);
   rx_user_idx = rx_dma_idx = 0;
   tx_user_idx = tx_dma_idx = tx_dma_size = 0;
-  tx_dma_active = false;
 }
 
 void SerialDMA::init_dma() {
@@ -139,6 +131,7 @@ void SerialDMA::init_dma() {
 
 #if PICO_RP2040
   // RP2040 does not have self trigger, use second dma channel to re-trigger rx channel
+  // DMA uart read
   if(rx_dma_ch < 0) rx_dma_ch = dma_claim_unused_channel(true);
   if(rx_ctrl_dma_ch < 0) rx_ctrl_dma_ch = dma_claim_unused_channel(true);
 
@@ -160,10 +153,11 @@ void SerialDMA::init_dma() {
   channel_config_set_dreq(&rx_config, rx_dreq);
   channel_config_set_chain_to(&rx_config, rx_ctrl_dma_ch);
   channel_config_set_enable(&rx_config, true);
-  // rx_buf_len<<16: fill buffer 65536 times before chaining to ctrl_ch (count is 32 bit on RP2040)
+  // note: rx_buf_len<<16 to fill buffer 65536 times before chaining to ctrl_ch (remove <<16 to test chaining)
   dma_channel_configure(rx_dma_ch, &rx_config, rx_buf, uart_dr, ((uint32_t)rx_buf_len) << 16, true);
 #else
   // RP2350 has self trigger
+  // DMA uart read
   if(rx_dma_ch < 0) rx_dma_ch = dma_claim_unused_channel(true);
   dma_channel_config rx_config = dma_channel_get_default_config(rx_dma_ch);
   channel_config_set_transfer_data_size(&rx_config, DMA_SIZE_8);
@@ -176,75 +170,60 @@ void SerialDMA::init_dma() {
   dma_channel_set_irq0_enabled(rx_dma_ch, false);
 #endif
 
-  // DMA uart write (started on demand by serviceTx)
+  /// DMA uart write (started by write())
   if(tx_dma_ch < 0) tx_dma_ch = dma_claim_unused_channel(true);
   dma_channel_config tx_config = dma_channel_get_default_config(tx_dma_ch);
   channel_config_set_transfer_data_size(&tx_config, DMA_SIZE_8);
   channel_config_set_read_increment(&tx_config, true);
   channel_config_set_write_increment(&tx_config, false);
+  channel_config_set_ring(&tx_config, false, tx_buf_len_pow); //false = read buffer
   channel_config_set_dreq(&tx_config, tx_dreq);
-  channel_config_set_ring(&tx_config, false, tx_buf_len_pow); //false = read buffer wraps
   dma_channel_configure(tx_dma_ch, &tx_config, uart_dr, tx_buf, 0, false);
 
   tx_user_idx = 0;
   tx_dma_idx = 0;
   tx_dma_size = 0;
-  tx_dma_active = false;
-}
-
-// Start a DMA transfer for all queued bytes, if DMA is idle. Never touches a transfer that is in flight.
-void SerialDMA::serviceTx() {
-  if(tx_dma_ch < 0 || !tx_buf) return;
-
-  if(tx_dma_active) {
-    if(dma_channel_is_busy(tx_dma_ch)) return;
-
-    // previous transfer completed
-    tx_dma_idx = (tx_dma_idx + tx_dma_size) & (tx_buf_len - 1);
-    tx_dma_size = 0;
-    tx_dma_active = false;
-  }
-
-  if(tx_user_idx == tx_dma_idx) return; // queue empty
-
-  // all queued bytes (ring wrap is handled by the DMA read ring)
-  uint16_t pending = (tx_user_idx + tx_buf_len - tx_dma_idx) & (tx_buf_len - 1);
-
-  __dmb(); // make sure buffer writes are visible before DMA starts reading
-
-  tx_dma_size = pending;
-  tx_dma_active = true;
-  dma_channel_set_read_addr(tx_dma_ch, &tx_buf[tx_dma_idx], false);
-  dma_channel_set_trans_count(tx_dma_ch, pending, true); //trigger
-}
-
-void SerialDMA::service() {
-  serviceTx();
 }
 
 uint16_t SerialDMA::availableForWrite() {
   if(tx_dma_ch < 0 || !tx_buf) return 0;
-  serviceTx();
-  return (tx_dma_idx + tx_buf_len - tx_user_idx - 1) & (tx_buf_len - 1);
+  // transfer_count = bytes the dma still has to send. It can only shrink while we look, so the result is conservative.
+  uint32_t pending = dma_channel_hw_addr(tx_dma_ch)->transfer_count;
+  if(pending > (uint32_t)(tx_buf_len - 1)) return 0;
+  return (uint16_t)(tx_buf_len - 1 - pending);
 }
 
 uint16_t SerialDMA::write(const uint8_t* data, uint16_t length) {
   if(tx_dma_ch < 0 || !tx_buf || !data || length == 0) return 0;
 
-  serviceTx();
+  uint16_t avail = availableForWrite();
+  if(length > avail) return 0; // not enough space to write, nothing written
 
-  uint16_t avail = (tx_dma_idx + tx_buf_len - tx_user_idx - 1) & (tx_buf_len - 1);
-  if(length > avail) return 0; // not enough space, nothing written
-
+  //copy to dma buffer. This only touches the free area, which the dma is not reading.
   uint16_t first = length;
   if(first > tx_buf_len - tx_user_idx) first = tx_buf_len - tx_user_idx;
   memcpy(&tx_buf[tx_user_idx], data, first);
-  uint16_t second = length - first;
-  if(second > 0) memcpy(tx_buf, data + first, second);
-
+  if(length > first) memcpy(tx_buf, data + first, length - first);
   tx_user_idx = (tx_user_idx + length) & (tx_buf_len - 1);
 
-  serviceTx();
+  __dmb(); //buffer writes must be visible before the dma (re)starts reading
+
+  //extend the running transfer by restarting it:
+  //1. stop the channel first (abort waits for an in-flight byte to complete)
+  //2. only THEN read transfer_count - it is exact now (reading it before the abort would be stale,
+  //   some bytes could already have been sent, and would be sent again after the restart)
+  dma_channel_hw_t *hw = dma_channel_hw_addr(tx_dma_ch);
+  if(dma_channel_is_busy(tx_dma_ch)) {
+    dma_channel_abort(tx_dma_ch);
+  }
+  uint32_t bytes_remaining = hw->transfer_count;               // 0 if the previous transfer already completed
+  uint32_t bytes_sent = tx_dma_size - bytes_remaining;         // bytes of the previous transfer that were sent
+  tx_dma_idx = (tx_dma_idx + bytes_sent) & (tx_buf_len - 1);
+  tx_dma_size = bytes_remaining + length;
+
+  //restart: channel config (ring, dreq, ...) is untouched by the abort
+  dma_channel_set_read_addr(tx_dma_ch, &tx_buf[tx_dma_idx], false);
+  dma_channel_set_trans_count(tx_dma_ch, tx_dma_size, true); //trigger
 
   return length;
 }
@@ -252,7 +231,7 @@ uint16_t SerialDMA::write(const uint8_t* data, uint16_t length) {
 uint16_t SerialDMA::available() {
   if(rx_dma_ch < 0 || !rx_buf) return 0;
 
-  // transfer_count counts down; on RP2350 the upper bits contain the trigger mode, masking removes them
+  //update buffer tail (on RP2350 the upper bits of transfer_count hold the trigger mode, the mask removes them)
   rx_dma_idx = (rx_buf_len - dma_channel_hw_addr(rx_dma_ch)->transfer_count) & (rx_buf_len - 1);
 
   if(rx_user_idx <= rx_dma_idx) return rx_dma_idx - rx_user_idx;
@@ -262,11 +241,11 @@ uint16_t SerialDMA::available() {
 uint16_t SerialDMA::read(uint8_t* data, uint16_t length) {
   if(!data || length == 0) return 0;
 
-  uint16_t avail = available(); // also refreshes rx_dma_idx
-  if(avail < length) length = avail;
+  uint16_t avail = available(); //also refreshes rx_dma_idx
+  if(avail < length) length = avail; // read as much as we have
   if(length == 0) return 0;
 
-  uint16_t left = rx_buf_len - rx_user_idx; // bytes until end of ring
+  uint16_t left = rx_buf_len - rx_user_idx; //bytes until end of ring
   if(left > length) left = length;
   memcpy(data, &rx_buf[rx_user_idx], left);
   if(left < length) memcpy(&data[left], rx_buf, length - left);
