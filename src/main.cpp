@@ -9,6 +9,8 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 #include "wind.h"      // wind measurement
 #include "ble.h"       // bluetooth reporting
 
+#include "hardware/watchdog.h"
+
 // --- forward declarations, only needed because setup()/loop() (below) call/use
 //     these before their definitions appear later in this same file ---
 void wind_task(void *pvParameters);
@@ -23,9 +25,36 @@ uint32_t speed_up_count = 0;
 volatile float wind_dt_min = 1e9f, wind_dt_max = 0, wind_dt_sum = 0;
 volatile uint32_t wind_dt_count = 0;
 
+extern "C" void hardfault_c(uint32_t *sp) {
+  watchdog_hw->scratch[0] = 0xDEADFA17;
+  watchdog_hw->scratch[1] = sp[6];                          // stacked PC
+  watchdog_hw->scratch[2] = sp[5];                          // stacked LR
+  watchdog_hw->scratch[3] = *(volatile uint32_t*)0xE000ED28; // CFSR (Cortex-M33 / RP2350 only)
+  watchdog_reboot(0, 0, 10);
+  while (1) {}
+}
+
+extern "C" __attribute__((naked)) void isr_hardfault(void) {
+  __asm volatile(
+    "tst lr, #4 \n"
+    "ite eq \n"
+    "mrseq r0, msp \n"
+    "mrsne r0, psp \n"
+    "b hardfault_c \n"
+  );
+}
+
+
 void setup() {
   // Setup madflight modules, start madflight RTOS tasks, Serial.begin(11520)
   madflight_setup();
+
+  // Print out it there has been a hard fault and 
+  if (watchdog_hw->scratch[0] == 0xDEADFA17) {
+  Serial.printf("HARDFAULT pc=%08lx lr=%08lx cfsr=%08lx\n",
+    (unsigned long)watchdog_hw->scratch[1], (unsigned long)watchdog_hw->scratch[2], (unsigned long)watchdog_hw->scratch[3]);
+  watchdog_hw->scratch[0] = 0;
+}
 
   // --- pressure probe: config + start the SDP3x array, then spawn the wind task ---
   wind.config.i2c_bus = hal_get_i2c_bus(1); //I2C1 - matches bus used for sensor bring-up
