@@ -2,205 +2,141 @@
 #include <math.h>
 #include "ble.h"
 
-#include <string.h>
-#include <stdio.h>
-#include <stdint.h>
-
 BleData ble_data;
 
-static uint32_t ble_tx_failures = 0;
-static uint32_t ble_format_errors = 0;
-static uint32_t ble_tx_bytes = 0;
-
+// Diagnostics, printed once per second to the USB serial (disable: BLE_DEBUG 0)
+// Also prints the last RMC and GGA sentence exactly as sent, so they can be pasted into an NMEA validator.
+#define BLE_DEBUG 0
+static uint32_t cnt_ok = 0, cnt_drop = 0, cnt_rmc = 0, cnt_gga = 0, cnt_pull_ok = 0, cnt_new_fix = 0;
+static uint32_t cnt_no_time = 0; // GPS solutions skipped because no UTC date is available (time_week == 0)
+static uint32_t cnt_long = 0;    // sentences longer than the NMEA maximum of 82 characters
+#if BLE_DEBUG
+static char dbg_rmc[100] = "", dbg_gga[100] = "";
+#endif
 
 // GPS-UTC offset. GpsState.time is GPS time; NMEA wants UTC. This has been 18 s
 // since the 2016-12-31 leap second - revisit if another one is ever announced.
 #define GPS_UTC_LEAP_SECONDS 18
 
-// Standard NMEA checksum: XOR all bytes between '$' and '*' (or the terminating NUL).
+// NMEA 0183: a sentence is at most 82 characters including '$' and CRLF
+#define NMEA_MAX_LEN 82
+
+// Standard NMEA checksum: XOR of all bytes between '$' and '*'
 static uint8_t nmea_checksum(const char *s) {
   uint8_t cs = 0;
-
-  if (s == nullptr || *s != '$') {
-    return 0;
-  }
-
-  for (const char *p = s + 1; *p && *p != '*'; ++p) {
-    cs ^= (uint8_t)*p;
-  }
-
+  for (const char *p = s + 1; *p && *p != '*'; p++) cs ^= (uint8_t)*p;
   return cs;
 }
 
-// Safely append "value,". NAN produces an empty field.
-static bool appendField(
-    char *buf,
-    size_t bufsize,
-    float value,
-    const char *fmt = "%.1f"
-) {
-  if (buf == nullptr || bufsize == 0) {
-    return false;
-  }
+//==============================================================================
+// Float formatting WITHOUT newlib's printf float support.
+// snprintf("%f") uses newlib's dtoa, which keeps a shared, unlocked free-list. Two tasks formatting floats at the
+// same time corrupt it and the MCU hard faults in mprec.c. Integer-only formatting has no shared state.
+//==============================================================================
 
-  size_t len = strlen(buf);
-
-  if (len >= bufsize) {
-    return false;
-  }
-
-  int n = 0;
-
-  if (isnan(value)) {
-    n = snprintf(buf + len, bufsize - len, ",");
+// Formats v with 'decimals' decimals (0..4), optional '+' sign for positive numbers. Never produces "-0.0".
+static void fmt_fixed(char *out, size_t n, float v, int decimals, bool plus = false) {
+  static const uint32_t p10[] = {1, 10, 100, 1000, 10000};
+  if (decimals < 0) decimals = 0;
+  if (decimals > 4) decimals = 4;
+  bool neg = v < 0;
+  float a = neg ? -v : v;
+  if (a > 1.0e5f) a = 1.0e5f;                                   // clamp: keeps scaled value inside 32 bit
+  uint32_t scaled = (uint32_t)(a * (float)p10[decimals] + 0.5f);
+  if (scaled == 0) neg = false;                                 // rounded to zero -> no negative zero
+  const char *sign = neg ? "-" : (plus ? "+" : "");
+  uint32_t ip = scaled / p10[decimals];
+  uint32_t fp = scaled % p10[decimals];
+  if (decimals == 0) {
+    snprintf(out, n, "%s%lu", sign, (unsigned long)ip);
   } else {
-    n = snprintf(buf + len, bufsize - len, fmt, value);
-
-    if (n < 0 || (size_t)n >= bufsize - len) {
-      return false;
-    }
-
-    len += (size_t)n;
-    n = snprintf(buf + len, bufsize - len, ",");
+    char frac[6];
+    for (int i = decimals - 1; i >= 0; i--) { frac[i] = '0' + (fp % 10); fp /= 10; }
+    frac[decimals] = '\0';
+    snprintf(out, n, "%s%lu.%s", sign, (unsigned long)ip, frac);
   }
-
-  return n >= 0 && (size_t)n < bufsize - len;
 }
 
-// Append the optional checksum and CRLF, then transmit.
-// Returns the number of bytes accepted by MF_Serial::write().
-static uint16_t sendRaw(
-    MF_Serial *ser,
-    char *buf,
-    size_t bufsize,
-    bool checksum
-) {
-  if (ser == nullptr || buf == nullptr || bufsize == 0) {
-    ++ble_tx_failures;
-    return 0;
-  }
+// Appends "value," or just "," if value is NAN (field not available).
+static void appendField(char *buf, size_t bufsize, float value, int decimals = 1, bool plus = false) {
+  char tmp[16];
+  if (isnan(value)) tmp[0] = '\0';
+  else fmt_fixed(tmp, sizeof(tmp), value, decimals, plus);
+  strncat(buf, tmp, bufsize - strlen(buf) - 1);
+  strncat(buf, ",", bufsize - strlen(buf) - 1);
+}
 
-  // Find the terminating NUL safely.
-  char *end = (char *)memchr(buf, '\0', bufsize);
-
-  if (end == nullptr) {
-    ++ble_format_errors;
-    return 0;
-  }
-
-  size_t len = (size_t)(end - buf);
+// Optionally appends *CS, then CRLF, and writes the buffer out as-is.
+// Returns false if the UART refused it: the RP2 DMA serial write() is all-or-nothing
+// and returns 0 when the whole sentence doesn't fit in the free TX buffer space.
+static bool sendRaw(MF_Serial *ser, char *buf, size_t bufsize, bool checksum) {
   char tail[8];
-
-  int tail_len;
-
-  if (checksum) {
-    tail_len = snprintf(
-        tail, sizeof(tail), "*%02X\r\n", nmea_checksum(buf));
-  } else {
-    tail_len = snprintf(tail, sizeof(tail), "\r\n");
+  if (checksum) snprintf(tail, sizeof(tail), "*%02X\r\n", nmea_checksum(buf));
+  else snprintf(tail, sizeof(tail), "\r\n");
+  strncat(buf, tail, bufsize - strlen(buf) - 1);
+  int len = (int)strlen(buf);
+  if (len > NMEA_MAX_LEN) cnt_long++;
+  if (ser->write((uint8_t*)buf, len) == len) {
+    cnt_ok++;
+#if BLE_DEBUG
+    if (strncmp(buf + 1, "GNRMC", 5) == 0) strncpy(dbg_rmc, buf, sizeof(dbg_rmc) - 1);
+    else if (strncmp(buf + 1, "GNGGA", 5) == 0) strncpy(dbg_gga, buf, sizeof(dbg_gga) - 1);
+#endif
+    return true;
   }
-
-  if (tail_len < 0 ||
-      (size_t)tail_len >= sizeof(tail) ||
-      len + (size_t)tail_len >= bufsize) {
-    ++ble_format_errors;
-    return 0;
-  }
-
-  // Append the tail, including its terminating NUL.
-  memcpy(buf + len, tail, (size_t)tail_len + 1);
-
-  size_t total_len = len + (size_t)tail_len;
-
-  // MF_Serial::write() takes uint8_t* and returns int.
-  if (total_len > INT_MAX) {
-    ++ble_format_errors;
-    return 0;
-  }
-
-  int written = ser->write(
-      reinterpret_cast<uint8_t *>(buf),
-      (int)total_len
-  );
-
-  if (written < 0 || (size_t)written != total_len) {
-    ++ble_tx_failures;
-  }
-
-  if (written > 0) {
-    ble_tx_bytes += (uint32_t)written;
-  }
-
-  return written > 0 ? (uint16_t)written : 0;
+  cnt_drop++;
+  return false;
 }
 
-// Remove appendField()'s final comma, then transmit.
-static uint16_t sendSentence(
-    MF_Serial *ser,
-    char *buf,
-    size_t bufsize,
-    bool checksum
-) {
-  if (buf == nullptr || bufsize == 0) {
-    ++ble_format_errors;
-    return 0;
-  }
-
-  char *end = (char *)memchr(buf, '\0', bufsize);
-
-  if (end == nullptr) {
-    ++ble_format_errors;
-    return 0;
-  }
-
-  if (end > buf && end[-1] == ',') {
-    end[-1] = '\0';
-  }
-
+// Like sendRaw, but first drops the trailing comma left by appendField().
+static bool sendSentence(MF_Serial *ser, char *buf, size_t bufsize, bool checksum) {
+  size_t len = strlen(buf);
+  if (len > 0 && buf[len - 1] == ',') buf[len - 1] = '\0';
   return sendRaw(ser, buf, bufsize, checksum);
 }
 
 // $LK8EX1,pressure,altitude,vario,temperature,battery,*CS
 // pressure=999999 means "unavailable", so the receiver uses our fused altitude
 // instead of recomputing a baro-only one from raw pressure.
-static void send_LK8EX1(MF_Serial *ser, float altitude_m, float vario_ms, float temp_c, float batt_v) {
-  char buf[80*2] = "$LK8EX1,999999,";
-  appendField(buf, sizeof(buf), altitude_m, "%.0f");
-  appendField(buf, sizeof(buf), vario_ms * 100.0f, "%.0f"); //m/s -> cm/s
-  appendField(buf, sizeof(buf), temp_c, "%.0f");
-  appendField(buf, sizeof(buf), batt_v, "%.1f");
-  sendSentence(ser, buf, sizeof(buf), true);
-  //Serial.println(buf);
+static bool send_LK8EX1(MF_Serial *ser, float altitude_m, float vario_ms, float temp_c, float batt_v) {
+  char buf[80] = "$LK8EX1,999999,";
+  appendField(buf, sizeof(buf), altitude_m, 0);
+  appendField(buf, sizeof(buf), vario_ms * 100.0f, 0); //m/s -> cm/s
+  appendField(buf, sizeof(buf), temp_c, 0);
+  appendField(buf, sizeof(buf), batt_v, 1);
+  return sendSentence(ser, buf, sizeof(buf), true);
 }
 
 // $LXWP0,Y,TAS_kph,altitude,vario,,,,,,heading,windcourse,windspeed_kph*CS
 // altitude and vario stay blank: LK8EX1 owns them, and two sentences carrying
 // the same quantity risks the receiver preferring the wrong one.
-static void send_LXWP0(MF_Serial *ser, float tas_ms, float heading_deg, float wind_from_deg, float wind_speed_ms) {
-  char buf[96*2] = "$LXWP0,Y,";
-  appendField(buf, sizeof(buf), tas_ms * 3.6f, "%.1f");   //NAN stays NAN
+static bool send_LXWP0(MF_Serial *ser, float tas_ms, float heading_deg, float wind_from_deg, float wind_speed_ms) {
+  char buf[96] = "$LXWP0,Y,";
+  appendField(buf, sizeof(buf), tas_ms * 3.6f, 1);        //NAN stays NAN
   strncat(buf, ",,,,,,,", sizeof(buf) - strlen(buf) - 1); //altitude, vario + 5 unused fields
-  appendField(buf, sizeof(buf), heading_deg, "%.0f");
-  appendField(buf, sizeof(buf), wind_from_deg, "%.0f");
-  appendField(buf, sizeof(buf), wind_speed_ms * 3.6f, "%.1f");
-  sendSentence(ser, buf, sizeof(buf), true);
-  //Serial.println(buf);
+  appendField(buf, sizeof(buf), heading_deg, 0);
+  appendField(buf, sizeof(buf), wind_from_deg, 0);
+  appendField(buf, sizeof(buf), wind_speed_ms * 3.6f, 1);
+  return sendSentence(ser, buf, sizeof(buf), true);
 }
 
 // $XCTOD,field1,field2,field3  (no checksum, fields shown "as is" in XCTrack's
 // "External data" widget - text only: no gauge, no audio).
 //   field1 = netto [m/s], field2 = wind speed [km/h], field3 = wind from [deg]
-static void send_XCTOD(MF_Serial *ser, float netto_ms, float wind_speed_ms, float wind_from_deg) {
-  char buf[64*2] = "$XCTOD,";
-  appendField(buf, sizeof(buf), netto_ms, "%+.1f");
-  appendField(buf, sizeof(buf), wind_speed_ms * 3.6f, "%.0f");
-  appendField(buf, sizeof(buf), wind_from_deg, "%.0f");
-  sendSentence(ser, buf, sizeof(buf), false);
-  //Serial.println(buf);
+static bool send_XCTOD(MF_Serial *ser, float netto_ms, float wind_speed_ms, float wind_from_deg) {
+  char buf[64] = "$XCTOD,";
+  appendField(buf, sizeof(buf), netto_ms, 1, true);
+  appendField(buf, sizeof(buf), wind_speed_ms * 3.6f, 0);
+  appendField(buf, sizeof(buf), wind_from_deg, 0);
+  return sendSentence(ser, buf, sizeof(buf), false);
 }
 
 //==============================================================================
 // GPS: $GNRMC + $GNGGA built from madflight's GpsState
+//
+// XCTrack needs BOTH sentences, with a valid UTC date (only RMC carries the date) and matching timestamps:
+// per its own log, a GGA without a known date is dropped ("no date from RMC line"), and an RMC without an
+// altitude from GGA is incomplete ("Missing altitude fix"). So: RMC first, then GGA, same time, valid date.
 //==============================================================================
 
 // Days since 1970-01-01 -> civil date (Howard Hinnant's algorithm)
@@ -247,55 +183,56 @@ static void fmt_latlon(char *out, size_t n, int32_t v, bool is_lat) {
 
 // $GNRMC,hhmmss.ss,A,lat,N,lon,E,speed_kn,course,ddmmyy,,,A*CS
 // Without a fix: status V and empty position/speed/course, like a real receiver.
-static void send_GNRMC(MF_Serial *ser, const GpsState &g) {
-  char t[16*2] = "", d[8] = "";
+static bool send_GNRMC(MF_Serial *ser, const GpsState &g) {
+  char t[16] = "", d[8] = "";
   int hh, mm, ss, cs, day, mon, year;
   if (gps_to_utc(g, hh, mm, ss, cs, day, mon, year)) {
     snprintf(t, sizeof(t), "%02d%02d%02d.%02d", hh, mm, ss, cs);
     snprintf(d, sizeof(d), "%02d%02d%02d", day, mon, year % 100);
   }
-  char buf[100*2];
+  char buf[100];
   if (g.fix >= GPS_OK_FIX_2D) {
-    char la[20], lo[20];
+    char la[20], lo[20], kn[16], cg[16];
     fmt_latlon(la, sizeof(la), g.lat, true);
     fmt_latlon(lo, sizeof(lo), g.lon, false);
     float knots = (float)g.sog * 0.001f * 1.943844f;   //mm/s -> knots
     float cog = (float)g.cog * 1e-5f;                  //1E-5 deg -> deg
     if (cog < 0) cog += 360.0f;
-    snprintf(buf, sizeof(buf), "$GNRMC,%s,A,%s,%s,%.1f,%.1f,%s,,,A", t, la, lo, knots, cog, d);
+    fmt_fixed(kn, sizeof(kn), knots, 1);
+    fmt_fixed(cg, sizeof(cg), cog, 1);
+    snprintf(buf, sizeof(buf), "$GNRMC,%s,A,%s,%s,%s,%s,%s,,,A", t, la, lo, kn, cg, d);
   } else {
     snprintf(buf, sizeof(buf), "$GNRMC,%s,V,,,,,,,%s,,,N", t, d);
   }
-  sendRaw(ser, buf, sizeof(buf), true);
-  //Serial.println(buf);
+  return sendRaw(ser, buf, sizeof(buf), true);
 }
 
 // $GNGGA,hhmmss.ss,lat,N,lon,E,quality,numSV,hdop,alt_msl,M,,M,,*CS
 // Geoid separation is left blank on purpose: GpsState.undulation is documented as
-// "height WGS84 is above AMSL", the opposite sign convention to NMEA's, and
-// receivers take altitude MSL straight from the altitude field anyway.
-static void send_GNGGA(MF_Serial *ser, const GpsState &g) {
+// "height WGS84 is above AMSL", and it is unclear whether that is the same sign as NMEA's
+// separation, so it is not sent. Receivers take altitude MSL straight from the altitude field.
+static bool send_GNGGA(MF_Serial *ser, const GpsState &g) {
   char t[16] = "";
   int hh, mm, ss, cs, day, mon, year;
   if (gps_to_utc(g, hh, mm, ss, cs, day, mon, year)) {
     snprintf(t, sizeof(t), "%02d%02d%02d.%02d", hh, mm, ss, cs);
   }
-  char buf[100*2];
+  char buf[100];
   if (g.fix >= GPS_OK_FIX_2D) {
     int quality = 1;                                   //GPS fix
     if (g.fix == GPS_OK_FIX_3D_DGPS) quality = 2;
     else if (g.fix == GPS_OK_FIX_3D_RTK_FIXED) quality = 4;
     else if (g.fix == GPS_OK_FIX_3D_RTK_FLOAT) quality = 5;
-    char la[20], lo[20];
+    char la[20], lo[20], hd[16], al[16];
     fmt_latlon(la, sizeof(la), g.lat, true);
     fmt_latlon(lo, sizeof(lo), g.lon, false);
-    snprintf(buf, sizeof(buf), "$GNGGA,%s,%s,%s,%d,%02d,%.2f,%.1f,M,,M,,",
-             t, la, lo, quality, (int)g.sat, (float)g.hdop / 100.0f, (float)g.alt / 1000.0f);
+    fmt_fixed(hd, sizeof(hd), (float)g.hdop / 100.0f, 2);
+    fmt_fixed(al, sizeof(al), (float)g.alt / 1000.0f, 1);
+    snprintf(buf, sizeof(buf), "$GNGGA,%s,%s,%s,%d,%02d,%s,%s,M,,M,,", t, la, lo, quality, (int)g.sat, hd, al);
   } else {
     snprintf(buf, sizeof(buf), "$GNGGA,%s,,,,,0,%02d,,,M,,M,,", t, (int)g.sat);
   }
-  sendRaw(ser, buf, sizeof(buf), true);
-  //Serial.println(buf);
+  return sendRaw(ser, buf, sizeof(buf), true);
 }
 
 //==============================================================================
@@ -308,60 +245,73 @@ void ble_task(void *pvParameters) {
   MF_Serial *ser = hal_get_ser_bus(1, 115200);
 
   ScheduleFreq vario_schedule(10); //XCTrack gains nothing from faster than ~10 Hz
-  ScheduleFreq wind_schedule(5);   //wind is GPS-rate and averaged; Vector Vario sends it at 0.5 Hz
-  ScheduleFreq gps_schedule(2);    //GPS arrives at 10 Hz; 5 Hz halves the BLE traffic - raise it if XCTrack feels laggy
+  ScheduleFreq wind_schedule(2);   //wind is GPS-rate and averaged; Vector Vario sends it at 0.5 Hz
+  ScheduleFreq gps_schedule(5);    //GPS arrives at 10 Hz; 5 Hz halves the BLE traffic. For testing try 1 Hz: the HC-42 BLE link may not keep up
+  ScheduleFreq debug_schedule(1);
   uint32_t last_gps_time = 0;
 
+  // A sentence becomes "pending" when its schedule fires and stays pending until the
+  // UART accepts it. At most ONE sentence is written per loop pass, so we never dump
+  // ~220 bytes into the 256 byte DMA buffer (and the HC-42) in a single burst.
+  bool pend_vario = false, pend_wind = false, pend_xctod = false, pend_rmc = false, pend_gga = false;
+  GpsState gps_snap; //consistent snapshot, shared by the RMC + GGA of one fix
+
   for (;;) {
-    if (vario_schedule.expired()) {
+    if (vario_schedule.expired()) pend_vario = true;
+    if (wind_schedule.expired()) { pend_wind = true; pend_xctod = true; }
+    if (gps_schedule.expired()) {
+      GpsState g; //consistent snapshot from the message broker
+      if (gps.topic.pull_latest(&g)) {
+        cnt_pull_ok++;
+        //only send a NEW solution - repeating a stale one would make a dead GPS look alive
+        if (g.fix != NO_GPS && g.time != last_gps_time) {
+          last_gps_time = g.time;
+          int hh, mm, ss, cs, day, mon, year;
+          if (gps_to_utc(g, hh, mm, ss, cs, day, mon, year)) {
+            gps_snap = g;
+            pend_rmc = pend_gga = true;
+            cnt_new_fix++;
+          } else {
+            cnt_no_time++; //no UTC date yet: XCTrack would drop these sentences anyway
+          }
+        }
+      }
+    }
+
+    if (pend_rmc) {
+      if (send_GNRMC(ser, gps_snap)) { pend_rmc = false; cnt_rmc++; }
+    } else if (pend_gga) {
+      if (send_GNGGA(ser, gps_snap)) { pend_gga = false; cnt_gga++; }
+    } else if (pend_vario) {
       BleData d = ble_data; //snapshot of independent scalars
       float vario = isnan(d.te_vario_ms) ? alt.getV() : d.te_vario_ms;
-      send_LK8EX1(ser, alt.getH(), vario, bar.temp, bat.v);
-    }
-    if (wind_schedule.expired()) {
+      if (send_LK8EX1(ser, alt.getH(), vario, bar.temp, bat.v)) pend_vario = false;
+    } else if (pend_wind) {
       BleData d = ble_data;
-      send_LXWP0(ser, d.tas_ms, ahr.yaw, d.wind_from_deg, d.wind_speed_ms);
-      if (!isnan(d.netto_ms) || !isnan(d.wind_speed_ms)) {
-        send_XCTOD(ser, d.netto_ms, d.wind_speed_ms, d.wind_from_deg);
-      }
+      if (send_LXWP0(ser, d.tas_ms, ahr.yaw, d.wind_from_deg, d.wind_speed_ms)) pend_wind = false;
+    } else if (pend_xctod) {
+      BleData d = ble_data;
+      if (!isnan(d.netto_ms) || !isnan(d.wind_speed_ms)) send_XCTOD(ser, d.netto_ms, d.wind_speed_ms, d.wind_from_deg);
+      pend_xctod = false;
     }
-    if (gps_schedule.expired()) {
-      GpsState g; //consistent snapshot from the message broker, not a field-by-field read
-      //only send when the receiver produced a NEW solution - repeating a stale one
-      //would make a dead GPS look alive to XCTrack
-      if (gps.topic.pull_latest(&g) && g.fix != NO_GPS && g.time != last_gps_time) {
-        last_gps_time = g.time;
-        send_GNRMC(ser, g);
-        send_GNGGA(ser, g);
-      }
+
+#if BLE_DEBUG
+    if (debug_schedule.expired()) {
+      // integer-only format strings on purpose (no float printf, see fmt_fixed)
+      Serial.printf("[BLE] gps fix=%d sat=%d week=%u time=%lu | pull_ok=%lu new_fix=%lu no_time=%lu rmc=%lu gga=%lu | uart ok=%lu DROPPED=%lu long=%lu txfree=%d\n",
+        (int)gps.fix, (int)gps.sat, (unsigned)gps.time_week, (unsigned long)gps.time,
+        (unsigned long)cnt_pull_ok, (unsigned long)cnt_new_fix, (unsigned long)cnt_no_time, (unsigned long)cnt_rmc, (unsigned long)cnt_gga,
+        (unsigned long)cnt_ok, (unsigned long)cnt_drop, (unsigned long)cnt_long, (int)ser->availableForWrite());
+      if (dbg_rmc[0]) Serial.print(dbg_rmc);
+      if (dbg_gga[0]) Serial.print(dbg_gga);
     }
-    
-    /*char buf[100*2];
-    snprintf(buf, sizeof(buf),
-         "$GNRMC,123519.00,A,4807.038,N,01131.000,E,022.4,084.4,171026,003.1,E,A");
-    Serial.print(buf);
-    delay(20);
-    sendRaw(ser, buf, sizeof(buf), true);
-    */
- /*   static uint32_t last_stack_report = 0;
+#endif
 
-if (millis() - last_stack_report >= 5000) {
-    last_stack_report = millis();
-
-    UBaseType_t free_words =
-        uxTaskGetStackHighWaterMark(NULL);
-
-    Serial.printf(
-        "[BLE] stack min free: %u words (%u bytes)\n",
-        (unsigned)free_words,
-        (unsigned)(free_words * sizeof(StackType_t))
-    );
-}*/
-    vTaskDelay(2);
+    delay(10); //10 ms between sentences also gives the HC-42 time to forward them over BLE
   }
 }
 
 void ble_task_start() {
-  //2x the default stack: several 100-byte sentence buffers plus float snprintf()
+  //2x the default stack: several 100-byte sentence buffers plus snprintf()
   hal_xTaskCreate(ble_task, "mf_BLE", 2 * MF_FREERTOS_DEFAULT_STACK_SIZE, NULL, uxTaskPriorityGet(NULL), NULL, 0);
 }
