@@ -7,7 +7,7 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 #include "main.h"      // MF_BOARD + madflight_config - must come BEFORE madflight.h
 #include <madflight.h> // Include the library, do this after madflight_config
 #include "wind.h"      // wind measurement
-#include "ble.h"       // bluetooth reporting
+#include "blelink.h"       // bluetooth reporting
 
 #include "hardware/watchdog.h"
 
@@ -64,7 +64,7 @@ void setup() {
     Serial.println("[WIND] setup OK");
   }
   wind_task_start();
-  ble_task_start();
+  blelink_task_start();
 
   Serial.println("Setup completed, CLI started - Type 'help' for help, or 'diff' to debug");
   avg_speed_up = 0;

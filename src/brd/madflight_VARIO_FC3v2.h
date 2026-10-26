@@ -91,8 +91,8 @@ pin_ser0_rx   13
 pin_ser0_tx   12
 
 //--- Serial bus 1 ---
-pin_ser1_rx   25
-pin_ser1_tx   24 
+pin_ser1_rx   20
+pin_ser1_tx   21 
 
 //--- SPI bus 0 ---
 pin_spi0_miso -1
