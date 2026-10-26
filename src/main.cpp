@@ -6,24 +6,28 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 ##########################################################################################################################*/
 #include "main.h"      // MF_BOARD + madflight_config - must come BEFORE madflight.h
 #include <madflight.h> // Include the library, do this after madflight_config
+#include "mf_print.h"  // Safe printf
 #include "wind.h"      // wind measurement
 #include "blelink.h"       // bluetooth reporting
 
 #include "hardware/watchdog.h"
+
+MfPrint mfSerial(Serial); //safe printing to serial
 
 // --- forward declarations, only needed because setup()/loop() (below) call/use
 //     these before their definitions appear later in this same file ---
 void wind_task(void *pvParameters);
 void wind_task_start();
 
-float avg_speed_up = 0 ;
-uint32_t speed_up_count = 0;
-
-// Shared dt diagnostics - simple scalars, read/reset from loop() without a lock.
-// Each is independently valid even under a rare torn read (same tolerance the
-// framework itself relies on for e.g. GPS lat/lon) - fine for a diagnostic print.
+// Shared dt diagnostics for wind task
 volatile float wind_dt_min = 1e9f, wind_dt_max = 0, wind_dt_sum = 0;
 volatile uint32_t wind_dt_count = 0;
+
+  // Accumulate for averaging
+  static float sum_bar_height = 0;
+  static float sum_ahr_accel  = 0;
+  static float sum_speed_up   = 0;
+  static uint32_t sample_count = 0;
 
 extern "C" void hardfault_c(uint32_t *sp) {
   watchdog_hw->scratch[0] = 0xDEADFA17;
@@ -44,6 +48,51 @@ extern "C" __attribute__((naked)) void isr_hardfault(void) {
   );
 }
 
+void printAltEstimator(){
+    // Read vertical measurements
+  float bar_height       = bar.alt;
+  float ahr_acceleration = ahr.getAccelUp();
+  float speed_up         = alt.getV();
+
+  sum_bar_height += bar_height;
+  sum_ahr_accel  += ahr_acceleration;
+  sum_speed_up   += speed_up;
+  sample_count++;
+
+  // Print average every 10 samples
+  if (sample_count >= 10) {
+    mfSerial.printf(
+      "Bar height: %8.2f m | AHR vertical accel: %8.3f m/s^2 | Alt vertical speed: %8.2f m/s\n",
+      sum_bar_height / sample_count,
+      sum_ahr_accel / sample_count,
+      sum_speed_up / sample_count
+    );
+
+    sum_bar_height = 0;
+    sum_ahr_accel  = 0;
+    sum_speed_up   = 0;
+    sample_count   = 0;
+  }
+}
+
+void printWindSensors(){
+   WindState w;
+   if (wind.topic.pull_latest(&w)) {
+     //snapshot + reset the dt stats (simple scalars, no lock needed - see wind_task)
+     float dt_min = wind_dt_min, dt_max = wind_dt_max, dt_sum = wind_dt_sum;
+     uint32_t dt_count = wind_dt_count;
+     wind_dt_min = 1e9f; wind_dt_max = 0; wind_dt_sum = 0; wind_dt_count = 0;
+     float dt_avg = (dt_count > 0) ? (dt_sum / dt_count) : 0;
+     mfSerial.printf(
+       "[WIND] center dp=%7.2fPa t=%5.1fC (%s)  topbot dp=%7.2fPa (%s)  leftright dp=%7.2fPa (%s)  "
+       "dt min/avg/max=%.4f/%.4f/%.4f n=%lu\n",
+       w.center.dp, w.center.temp, w.center.valid ? "ok" : "FAIL",
+       w.topbot.dp, w.topbot.valid ? "ok" : "FAIL",
+       w.leftright.dp, w.leftright.valid ? "ok" : "FAIL",
+       dt_min, dt_avg, dt_max, (unsigned long)dt_count
+     );
+  }
+}
 
 void setup() {
   // Setup madflight modules, start madflight RTOS tasks, Serial.begin(11520)
@@ -67,51 +116,17 @@ void setup() {
   blelink_task_start();
 
   Serial.println("Setup completed, CLI started - Type 'help' for help, or 'diff' to debug");
-  avg_speed_up = 0;
 }
 
 void loop() {
-  // Printing lives here, not in wind_task - Serial I/O can block for a few ms
-  // without touching the 500Hz read loop, since this runs as its own thing.
-
+  //mostly used for printing
   TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(100); //100Hz target
+  const TickType_t period = pdMS_TO_TICKS(10); //100Hz target
 
- /*
- // Printing of vertical speed
- float speed_up = alt.getV();
+  printAltEstimator(); 
 
-  avg_speed_up += speed_up;
-  speed_up_count++;
+  //printWindSensors();
 
-
-  if(speed_up_count >= 10) {
-  Serial.printf("ALT VSpeed %7.2f \n", avg_speed_up/speed_up_count);
-  avg_speed_up = 0;
-  speed_up_count = 0;
-  }
-
-  */
-
-  /*
-  //printing of wind sensors
-   WindState w;
-   if (wind.topic.pull_latest(&w)) {
-     //snapshot + reset the dt stats (simple scalars, no lock needed - see wind_task)
-     float dt_min = wind_dt_min, dt_max = wind_dt_max, dt_sum = wind_dt_sum;
-     uint32_t dt_count = wind_dt_count;
-     wind_dt_min = 1e9f; wind_dt_max = 0; wind_dt_sum = 0; wind_dt_count = 0;
-     float dt_avg = (dt_count > 0) ? (dt_sum / dt_count) : 0;
-     Serial.printf(
-       "[WIND] center dp=%7.2fPa t=%5.1fC (%s)  topbot dp=%7.2fPa (%s)  leftright dp=%7.2fPa (%s)  "
-       "dt min/avg/max=%.4f/%.4f/%.4f n=%lu\n",
-       w.center.dp, w.center.temp, w.center.valid ? "ok" : "FAIL",
-       w.topbot.dp, w.topbot.valid ? "ok" : "FAIL",
-       w.leftright.dp, w.leftright.valid ? "ok" : "FAIL",
-       dt_min, dt_avg, dt_max, (unsigned long)dt_count
-     );
-  }
-  */
   vTaskDelayUntil(&lastWakeTime, period);
 }
 
