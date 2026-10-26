@@ -45,7 +45,7 @@ public:
   uint16_t read(uint8_t* data, uint16_t length);
   uint16_t available();
   uint16_t availableForWrite();
-  void service(); //only needed if the DMA interrupt could not be installed (see tx_irq_ok): pushes queued bytes out
+  void service(); //only needed if the DMA interrupt could not be installed (see irqActive()): pushes queued bytes out
 
   int readBytes(char *buf, int len) {return read((uint8_t*)buf, len);}
   void begin(int baud) {setBaud(baud);}
@@ -54,9 +54,12 @@ public:
 
   }
 
-  void irqHandler(); //internal: called from the shared DMA interrupt handler
+  bool irqActive() { return tx_irq_ok; } //true: TX uses the DMA completion interrupt, false: polling fallback
 
 private:
+  void irqHandler();           //handles TX completion for this instance (called from dmaIrqHandler)
+  static void dmaIrqHandler(); //shared DMA interrupt handler (all instances)
+
   uart_inst_t* uart_ = nullptr;
   uint8_t uart_num_ = 0;
 

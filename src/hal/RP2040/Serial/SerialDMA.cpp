@@ -45,7 +45,7 @@ static SerialDMA* s_instances[2] = {nullptr, nullptr};
 static bool s_irq_registered = false;
 static bool s_irq_ok = false;
 
-static void serialdma_dma_irq_handler() {
+void SerialDMA::dmaIrqHandler() {
   for(int i = 0; i < 2; i++) {
     SerialDMA* s = s_instances[i];
     if(s) s->irqHandler();
@@ -225,7 +225,7 @@ void SerialDMA::init_dma() {
   if(!s_irq_registered) {
     s_irq_registered = true;
     if(irq_get_exclusive_handler(SERIALDMA_IRQ) == nullptr) {
-      irq_add_shared_handler(SERIALDMA_IRQ, serialdma_dma_irq_handler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+      irq_add_shared_handler(SERIALDMA_IRQ, SerialDMA::dmaIrqHandler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
       irq_set_enabled(SERIALDMA_IRQ, true);
       s_irq_ok = true;
     }
