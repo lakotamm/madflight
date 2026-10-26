@@ -38,7 +38,7 @@
 #define MF_SYNC2 0x55
 #define MF_MAX_PAYLOAD 200
 #define MF_MAX_FRAME (6 + MF_MAX_PAYLOAD)
-#define MF_LINK_BAUD 230400   // ~1.8 kB/s of traffic, so 115200 has >5x headroom. Raise later if wanted.
+#define MF_LINK_BAUD 460800   // ~1.8 kB/s of traffic, so 115200 has >5x headroom. Raise later if wanted.
 
 enum : uint8_t {
   MF_MSG_INFO   = 0x01,
