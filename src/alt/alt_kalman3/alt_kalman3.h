@@ -46,9 +46,9 @@ public:
     //float biasCov = 0.0005; 
 
     //testing for Vario
-    float altCov = 50;   
+    float altCov = 80;   
     float accCov = 0.05;  
-    float biasCov = 0.0001; 
+    float biasCov = 0.0002; 
 
     Serial.printf("ALT: KALMAN3  altCov=%f accCov=%f biasCov=%f\n", altCov, accCov, biasCov);
 
