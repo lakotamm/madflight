@@ -398,7 +398,7 @@ void _imu_ll_interrupt_handler();
 
         Serial.printf("IMU: IMU_EXEC_FREERTOS_OTHERCORE call_core=%d imu_core=%d\n", callcore, othercore);
       #else
-        xTaskCreate(_imu_ll_task, "mf_IMU", MF_FREERTOS_DEFAULT_STACK_SIZE, NULL, IMU_FREERTOS_TASK_PRIORITY /*priority 0=lowest*/, &_imu_ll_task_handle);
+        xTaskCreate(_imu_ll_task, "mf_IMU", MF_FREERTOS_DEFAULT_STACK_SIZE * 2, NULL, IMU_FREERTOS_TASK_PRIORITY /*priority 0=lowest*/, &_imu_ll_task_handle);
         Serial.println("IMU: IMU_EXEC_FREERTOS");
       #endif
     }
