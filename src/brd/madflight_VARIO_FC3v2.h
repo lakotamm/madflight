@@ -36,7 +36,7 @@ pin_imu_int   27
 pin_imu_clkin 26
 imu_i2c_bus   -1
 imu_i2c_adr   0
-imu_rate      800
+imu_rate      400
 
 // Disabling filtering because of VQF filter, which is more accurate
 imu_gyr_lp    1e10

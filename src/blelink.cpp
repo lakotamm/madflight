@@ -3,6 +3,7 @@
 // shared headers are host-tested, this file was checked against the madflight sources.
 
 #include "madflight_modules.h"   // alt, ahr, bar, bat, gps, hal, MsgSubscription (same header cli.cpp uses)
+#include "ins_fusion.h" //height estimator
 #include "mf_ble_proto.h"
 #include "blelink.h"
 #include <math.h>
@@ -125,7 +126,7 @@ static void fill_state(MfState& s) {
   uint32_t valid = 0;
 
   const bool air_fresh = fresh(s_air_ms, now);
-  const float climb = alt.getV();   // ground-relative climb rate from the altitude Kalman filter
+  const float climb = insf.getV();   // ground-relative climb rate from the altitude Kalman filter
 
   // Vario: total-energy if the air-data producer supplies it, otherwise classic.
   // vario_mode always tells the truth about what the number is.

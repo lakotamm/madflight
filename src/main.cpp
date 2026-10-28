@@ -9,10 +9,12 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 #include "mf_print.h"  // Safe printf
 #include "wind.h"      // wind measurement
 #include "blelink.h"       // bluetooth reporting
+#include "ins_fusion.h"
 
 #include "hardware/watchdog.h"
 
 MfPrint mfSerial(Serial); //safe printing to serial
+InsFusion insf;
 
 // --- forward declarations, only needed because setup()/loop() (below) call/use
 //     these before their definitions appear later in this same file ---
@@ -25,8 +27,11 @@ volatile uint32_t wind_dt_count = 0;
 
   // Accumulate for averaging
   static float sum_bar_height = 0;
-  static float sum_ahr_accel  = 0;
+  static float sum_insf_height = 0;
   static float sum_speed_up   = 0;
+  static float sum_insf_speed_up = 0;
+  static float sum_insf_baro_speed_up = 0;
+
   static uint32_t sample_count = 0;
 
 extern "C" void hardfault_c(uint32_t *sp) {
@@ -51,26 +56,39 @@ extern "C" __attribute__((naked)) void isr_hardfault(void) {
 void printAltEstimator(){
     // Read vertical measurements
   float bar_height       = bar.alt;
-  float ahr_acceleration = ahr.getAccelUp();
+  float insf_height      = insf.getH();
   float speed_up         = alt.getV();
+  float height           = alt.getH();
+  float insf_speed_up    = insf.state.vel_up;
+  float insf_baro_speed_up = insf.state.baro_v_up;
 
   sum_bar_height += bar_height;
-  sum_ahr_accel  += ahr_acceleration;
   sum_speed_up   += speed_up;
+  sum_insf_speed_up += insf_speed_up;
+  sum_insf_height += insf_height;
+  sum_insf_baro_speed_up += insf_baro_speed_up;
   sample_count++;
 
   // Print average every 10 samples
   if (sample_count >= 10) {
     mfSerial.printf(
-      "Bar height: %8.2f m | AHR vertical accel: %8.3f m/s^2 | Alt vertical speed: %8.2f m/s\n",
+      "Bar height %6.2f m | INS(height) %6.2f m | Alt vert speed: %6.2f m/s |INS(baro) %6.2f v=%d | INS(gnss) %6.2f ready=%d mode=%d sats=%d\n",
       sum_bar_height / sample_count,
-      sum_ahr_accel / sample_count,
-      sum_speed_up / sample_count
+      sum_insf_height / sample_count,
+      sum_speed_up / sample_count,
+      sum_insf_baro_speed_up / sample_count, 
+      insf.state.baro_v_up_valid,
+      sum_insf_speed_up / sample_count,  
+      insf.state.ready, 
+      insf.state.mode, 
+      gps.sat
     );
 
     sum_bar_height = 0;
-    sum_ahr_accel  = 0;
+    sum_insf_height = 0;
     sum_speed_up   = 0;
+    sum_insf_speed_up = 0;
+    sum_insf_baro_speed_up = 0;
     sample_count   = 0;
   }
 }
@@ -98,6 +116,9 @@ void setup() {
   // Setup madflight modules, start madflight RTOS tasks, Serial.begin(11520)
   madflight_setup();
 
+  insf.setup();
+  ahr.gizmo = new AhrGizmoIns(&ahr, &insf);
+
   // Print out it there has been a hard fault and 
   if (watchdog_hw->scratch[0] == 0xDEADFA17) {
   Serial.printf("HARDFAULT pc=%08lx lr=%08lx cfsr=%08lx\n",
@@ -112,6 +133,8 @@ void setup() {
   } else {
     Serial.println("[WIND] setup OK");
   }
+
+  //insf.start_task(uxTaskPriorityGet(NULL) + 1, 1);
   wind_task_start();
   blelink_task_start();
 
@@ -133,7 +156,7 @@ void loop() {
 // This function is called from the IMU task when fresh IMU data is available.
 void imu_loop() {
   // Toggle led on every 800 samples (E.g. 1 second period at 800Hz sample rate)
-  if(imu.update_cnt % 800 == 0) led.toggle();
+  if(imu.update_cnt % 400 == 0) led.toggle();
 
   // AHRS sensor fusion - type 'pahr' in CLI to see results
   ahr.update();
@@ -166,7 +189,8 @@ void wind_task(void *pvParameters) {
     //If the hardware of the sensor board is alright, the reading should be done in less than 2ms/2ticks. 
     //However, in case there is some form of a failure, we still need to give other threads time to run
 
-    if(xTaskGetTickCount()- lastWakeTime >=2){
+    if(xTaskGetTickCount()- lastWakeTime >= pdMS_TO_TICKS(2)){
+      lastWakeTime = xTaskGetTickCount();
       vTaskDelay(1); // prioritise giving other threads time to run in case of a failure
     } else {
     vTaskDelayUntil(&lastWakeTime, period); // in most cases, run without a delay
