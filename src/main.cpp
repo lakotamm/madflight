@@ -13,6 +13,15 @@ MIT license - Copyright (c) 2023-2026 https://madflight.com
 
 #include "hardware/watchdog.h"
 
+//for overclocking
+#include "hardware/vreg.h"
+#include "hardware/clocks.h"
+#include "hardware/structs/qmi.h"
+#include "hardware/regs/qmi.h"
+
+constexpr uint32_t TARGET_KHZ = 360000;
+constexpr uint32_t FLASH_DIV  = 3;
+
 MfPrint mfSerial(Serial); //safe printing to serial
 InsFusion insf;
 
@@ -51,6 +60,45 @@ extern "C" __attribute__((naked)) void isr_hardfault(void) {
     "mrsne r0, psp \n"
     "b hardfault_c \n"
   );
+}
+
+void overclock(){
+  Serial.begin(115200);
+    delay(10000);
+
+    // Raise core voltage while still at 250 MHz.
+    vreg_set_voltage(VREG_VOLTAGE_1_30);
+    delay(10);
+
+    // Change the primary QMI memory-window flash divider to 3.
+    // Preserve RXDELAY and all other timing settings.
+    uint32_t timing = qmi_hw->m[0].timing;
+    timing &= ~QMI_M0_TIMING_CLKDIV_BITS;
+    timing |= (FLASH_DIV << QMI_M0_TIMING_CLKDIV_LSB);
+    qmi_hw->m[0].timing = timing;
+
+    // Complete a memory access and issue barriers before
+    // increasing the system clock.
+    volatile uint32_t dummy =
+        *reinterpret_cast<volatile uint32_t *>(XIP_BASE);
+    (void)dummy;
+    __asm volatile("dsb\nisb" ::: "memory");
+
+    // Increase system clock to 320 MHz.
+    bool ok = set_sys_clock_khz(TARGET_KHZ, true);
+
+    Serial.printf("Clock change: %s\n", ok ? "OK" : "FAILED");
+    Serial.printf("System clock: %lu MHz\n",
+                  clock_get_hz(clk_sys) / 1000000);
+
+    uint32_t final_timing = qmi_hw->m[0].timing;
+    uint32_t divider =
+        (final_timing & QMI_M0_TIMING_CLKDIV_BITS)
+        >> QMI_M0_TIMING_CLKDIV_LSB;
+
+    Serial.printf("QMI divider: %lu\n", divider);
+    Serial.printf("Nominal flash SCK: %.1f MHz\n",
+                  (float)clock_get_hz(clk_sys) / divider / 1000000.0f);
 }
 
 void printAltEstimator(){
@@ -112,12 +160,18 @@ void printWindSensors(){
   }
 }
 
+  void printOrientation() {
+  char buf[256];
+  insf.orientationString(buf, sizeof(buf));
+  mfSerial.printf("%s\n", buf);
+}
+
 void setup() {
-  // Setup madflight modules, start madflight RTOS tasks, Serial.begin(11520)
+  // Setup madflight modules, start madflight RTOS tasks,
+  overclock();
   madflight_setup();
 
-  insf.setup();
-  ahr.gizmo = new AhrGizmoIns(&ahr, &insf);
+  if (insf.setup() == 0) ahr.gizmo = new AhrGizmoIns(&ahr, &insf, true);   // true = feed_samples
 
   // Print out it there has been a hard fault and 
   if (watchdog_hw->scratch[0] == 0xDEADFA17) {
@@ -144,11 +198,15 @@ void setup() {
 void loop() {
   //mostly used for printing
   TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(10); //100Hz target
+  const TickType_t period = pdMS_TO_TICKS(100);
 
-  printAltEstimator(); 
+  //printAltEstimator(); 
 
   //printWindSensors();
+
+  printOrientation();
+
+
 
   vTaskDelayUntil(&lastWakeTime, period);
 }

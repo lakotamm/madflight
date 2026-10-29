@@ -21,7 +21,7 @@ BleLinkStatus blelink_status;
 // Heading must be relative to TRUE north, the AHRS gives MAGNETIC north (and indoors it
 // is meaningless). Set the local declination (east positive). 0 = uncorrected.
 #ifndef LINK_MAG_DECLINATION_DEG
-#define LINK_MAG_DECLINATION_DEG 0.0f
+#define LINK_MAG_DECLINATION_DEG 0.0f // keep at 0 deg for INSLIB
 #endif
 
 #ifndef LINK_MANUFACTURER
@@ -126,7 +126,7 @@ static void fill_state(MfState& s) {
   uint32_t valid = 0;
 
   const bool air_fresh = fresh(s_air_ms, now);
-  const float climb = insf.getV();   // ground-relative climb rate from the altitude Kalman filter
+  const float climb = insf.getV();   // ground-relative climb rate from INSLIB
 
   // Vario: total-energy if the air-data producer supplies it, otherwise classic.
   // vario_mode always tells the truth about what the number is.
@@ -177,11 +177,15 @@ static void fill_state(MfState& s) {
     }
   }
 
-  // Environment. Static pressure is the raw barometer value for now.
+  // Environment. Static pressure is filtered by INSLIB
   if (bar.press > 1000.0f) {
-    s.static_pressure = bar.press; valid |= MF_V_PRESSURE;
-    s.air_temp = bar.temp;         valid |= MF_V_TEMP;
+    float p = bar.press;
+    float pf;
+    if (insf.getStaticPressure(p, &pf)) p = pf;   // else fall back to raw
+    s.static_pressure = p; valid |= MF_V_PRESSURE;
+    s.air_temp = bar.temp; valid |= MF_V_TEMP;
   }
+
   if (fresh(s_rh_ms, now) && __builtin_isfinite(s_rh)) { s.humidity = s_rh; valid |= MF_V_HUMIDITY; }
 
   if (bat.v > 2.5f) { s.battery_pct = lipo_percent(bat.v); valid |= MF_V_BATTERY; }
