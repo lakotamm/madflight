@@ -60,12 +60,17 @@ void printAltEstimator(){
   }
 }
 
+ void printOrientation() {
+  char buf[256];
+  insf.orientationString(buf, sizeof(buf));
+  mfSerial.printf("%s\n", buf);
+}
+
 void setup() {
   // Setup madflight modules, start madflight RTOS tasks, Serial.begin(11520)
   madflight_setup();
 
-  insf.setup();
-  ahr.gizmo = new AhrGizmoIns(&ahr, &insf);
+  if (insf.setup() == 0) ahr.gizmo = new AhrGizmoIns(&ahr, &insf, true);   // true = feed_samples
 
   Serial.println("Setup completed, CLI started - Type 'help' for help, or 'diff' to debug");
 }
@@ -76,6 +81,7 @@ void loop() {
   const TickType_t period = pdMS_TO_TICKS(10); //100Hz target
 
   printAltEstimator(); 
+  //printOrientation();
 
   vTaskDelayUntil(&lastWakeTime, period);
 }

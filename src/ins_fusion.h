@@ -7,8 +7,50 @@ and publishes the solution on a MsgTopic ("ins").
 LICENSE: INSLIB is AGPL-3.0. This file links against it, so it and the firmware
 built with it fall under AGPL-3.0 as well (madflight is MIT, which is compatible).
 
-STATUS: first draft, written against the madflight and INSLIB sources without being
-able to compile it with the real toolchain. Items marked VERIFY need a bench check.
+STATUS: tested on the bench without GNSS (attitude + baro/accel filters). The GNSS-aided full INS has not been
+exercised on hardware yet. Items marked VERIFY need a bench check.
+
+------------------------------------------------------------------------------------------
+SETUP
+------------------------------------------------------------------------------------------
+1. Files: INSLIB src/ (all .c and .h) + KFCore c/{linalg,kalman_udu,miniblas}.c/h in your project (lib/ or src/), plus this file.
+2. platformio.ini - the continuation lines of build_flags MUST be indented:
+       build_flags =
+         -DKALMAN_MAX_STATE_SIZE=18
+         -DKALMAN_MAX_NOISE_SIZE=24
+         -DLOG_LEVEL=LOG_LEVEL_NONE
+3. main.cpp:   #include <madflight.h>  ... then  #include "ins_fusion.h"   and define once:   InsFusion insf;
+   Other files only #include "ins_fusion.h" (it pulls <madflight_modules.h>, never <madflight.h>).
+4. In setup(), after madflight_setup(), choose ONE of the two run modes below.
+
+RUN MODE A - own task (recommended; decouples the INS from the IMU task):
+       insf.config.samples_per_epoch = 1;          // optional: 2 = average pairs of samples = half the CPU
+       if (insf.setup() == 0) insf.start_task(<priority BELOW mf_IMU>, <core>, 5120);
+       // optional, so madflight's ahr.roll/pitch/yaw/q (CLI 'pahr', logs, blelink) show the INS attitude:
+       ahr.gizmo = new AhrGizmoIns(&ahr, &insf);   // reader only: copies the latest INS quaternion, no INS work in imu_loop()
+       imu_loop() keeps calling ahr.update();
+   The task drains imu.topic (a FIFO, depth 10 by default). A long epoch just delays the INS; the queued samples are
+   processed afterwards with their true timestamps, and the IMU task is never blocked. If the broker statistics show
+   'misses' on sub:ins_imu, enlarge the imu topic depth (imu.h) or lower the INS rate.
+
+RUN MODE B - inline in the IMU task (simplest, but every filter epoch blocks the IMU task):
+       if (insf.setup() == 0) ahr.gizmo = new AhrGizmoIns(&ahr, &insf, true);   // true = feed_samples
+       imu_loop() keeps calling ahr.update();      // the gizmo feeds every raw IMU sample to the INS
+   Needs an enlarged mf_IMU stack (the INS used ~11 KB of stack) and a worst-case epoch (insf.max_step_us) clearly
+   shorter than the IMU sample period; otherwise IMU samples are late (insf.n_gap counts them). Do not combine
+   modes A and B: the samples would be fed twice.
+
+Reading results (any mode):
+   insf.getV()/getH()            best climb rate / height above start (hasV() tells if a filter is running)
+   insf.getStaticPressure()      pressure consistent with the filtered baro height (for BLE etc.)
+   insf.getLatLon(), getHeightMsl(), getHeightEllipsoid(), markHome()/getAgh()   position/height, GNSS-aided
+   insf.state / insf.topic       the full solution
+   insf.orientationString()      one-line self-test text; insf.max_step_us / max_dt_us / n_gap - timing
+   insf.resetDiagnostics()       call after startup so one-off initialisation epochs do not dominate the maxima
+
+Time/CPU: the cost per epoch is dominated by the periodic covariance step (ins_options_t.kalman_update_dt_sec, 50 ms by
+default). Cost grows steeply with the number of filter states (15, or 18 with estimate_mag_bias) and is higher while GNSS
+is fused than in the attitude-only bench mode. Measure insf.max_step_us WITH a GNSS fix before choosing the rate.
 ==========================================================================================*/
 #pragma once
 
@@ -33,6 +75,8 @@ struct __attribute__((aligned(4))) InsFusionState {
   float baro_v_up = 0;      // baro_alt vertical-channel climb rate [m/s]
   bool  baro_v_up_valid = false;
   float baro_h = 0;         // baro_alt filter height relative to start [m] (same filter as baro_v_up)
+  float baro_h_isa = 0;     // baro_alt filter height as ISA (barometric) altitude [m] - datum independent, never GNSS-corrected
+  bool  baro_isa_valid = false;
 
   float pos_ned[3] = {0};   // local NED position relative to start [m]
   float height = 0;         // best local height above start, positive up [m]
@@ -43,6 +87,13 @@ struct __attribute__((aligned(4))) InsFusionState {
   bool  att_valid = false;
 
   float acc_bias[3] = {0};  // estimated accelerometer bias, body FRD [m/s^2]
+
+  // GNSS-aided absolute position (valid only in FULL mode, i.e. while GNSS is being fused)
+  bool   pos_valid = false;
+  double lat_deg = 0, lon_deg = 0;   // WGS84
+  float  h_ell = 0;                  // ellipsoid height [m]
+  bool   h_ell_valid = false;        // also valid during short GNSS outages (local height + estimated offset)
+  float  h_msl = 0;                  // ellipsoid height + geoid undulation [m] (needs gps.have_undulation, else = h_ell)
 };
 
 //---------------------------------------------------------------------------------
@@ -56,6 +107,9 @@ struct InsFusionConfig {
   float gnss_max_vel_acc_mps = 2.0f;
   float mag_year = 2026.8f;       // decimal year for the World Magnetic Model
   bool use_mag = true;
+  bool estimate_mag_bias = true;  // true: estimate the magnetometer hard-iron bias online (18-state mode). Does NOT replace
+                                  // a proper calibration (soft-iron is not modelled), but reduces yaw error from a rough one.
+                                  // Costs CPU: 18 instead of 15 filter states (worst-case epoch grows roughly with n^3).
 };
 
 //---------------------------------------------------------------------------------
@@ -91,12 +145,12 @@ public:
     ins_options_t opt;
     memset(&opt, 0, sizeof(opt));
     opt.auto_init = true;               // level + position from the first IMU/GNSS data
+    opt.estimate_mag_bias = config.estimate_mag_bias;
     // VERIFY: later tuning candidates (see ins.h ins_options_t): kalman_update_dt_sec (default 0.05 s),
     // gnss_max_*_stddev, imu_*_misalignment, imu_acc_fixed_bias (use your accel calibration), etc.
 
     if (nav_suite_init(&ns, &init, &opt) != 0) return -2;
 
-    imu_sub = new MsgSubscription<ImuState>("ins_imu", &imu.topic);
     started = true;
     Serial.printf("INS: nav_suite_t = %u bytes\n", (unsigned)sizeof(nav_suite_t));
     return 0;
@@ -200,6 +254,7 @@ public:
           float hacc = g.have_hacc ? g.hacc * 1e-3f : 5.0f;
           float vac2 = g.have_vacc ? g.vacc * 1e-3f : 8.0f;
           float undulation_mm = g.have_undulation ? (float)g.undulation : 0.0f;
+          undulation_m = undulation_mm * 1e-3f;
 
           m.gnss_pos.is_valid = true;
           m.gnss_pos.llh[0] = (double)g.lat * 1e-7 * (M_PI / 180.0);
@@ -260,6 +315,7 @@ public:
     float hb, vb;
     state.baro_v_up_valid = nav_suite_get_baro_alt(&ns, &hb, &vb);
     if (state.baro_v_up_valid) { state.baro_v_up = vb; state.baro_h = hb; }
+    state.baro_isa_valid = baro_alt_get_isa_altitude(&ns.baro_alt, &state.baro_h_isa);
 
     float p[3];
     if (state.ready && ins_get_position_local(&ns.ins, p)) for (int i = 0; i < 3; i++) state.pos_ned[i] = p[i];
@@ -280,6 +336,17 @@ public:
       state.q[2] = cr * sp * cy + sr * cp * sy;
       state.q[3] = cr * cp * sy - sr * sp * cy;
     }
+    state.pos_valid = false;
+    if (state.ready && state.mode == 3) {
+      double llh[3]; // INSLIB keeps lat/lon natively: no ECEF round trip (expensive without a double FPU, as on the RP2350)
+      if (ins_get_latlonh(&ns.ins, llh)) {
+        state.lat_deg = llh[0] * 57.29577951308232;
+        state.lon_deg = llh[1] * 57.29577951308232;
+        state.pos_valid = true;
+      }
+    }
+    state.h_ell_valid = nav_suite_get_height_ellipsoid(&ns, &state.h_ell);
+    state.h_msl = state.h_ell + undulation_m;
     float ab[3];
     if (state.ready && ins_get_bias_acc(&ns.ins, ab)) for (int i = 0; i < 3; i++) state.acc_bias[i] = ab[i];
 
@@ -305,6 +372,39 @@ public:
   float getV() { return (state.vel_up_valid && state.mode == 3) ? state.vel_up : state.baro_v_up; }
   // Best available height relative to start [m]
   float getH() { return state.height_valid ? state.height : state.baro_h; }
+  // Absolute position, valid only while GNSS-aided (FULL mode). Returns false otherwise: do not report INS position to
+  // anything while this is false - without GNSS the position drifts away within seconds.
+  bool getLatLon(double* lat_deg, double* lon_deg) {
+    if (!state.pos_valid) return false;
+    *lat_deg = state.lat_deg; *lon_deg = state.lon_deg; return true;
+  }
+  // WGS84 ellipsoid height [m]
+  bool getHeightEllipsoid(float* h) { if (!state.h_ell_valid) return false; *h = state.h_ell; return true; }
+  // Height above mean sea level [m] = ellipsoid height + undulation (undulation is 0 until the GNSS driver supplies it)
+  bool getHeightMsl(float* h) { if (!state.h_ell_valid) return false; *h = state.h_msl; return true; }
+  // Height above the start point [m] and above a point marked later (e.g. at launch). This is "above home", NOT above
+  // the terrain below you (no terrain data).
+  void markHome() { home_h = getH(); }
+  float getAgh() { return getH() - home_h; }
+
+  void resetDiagnostics() { max_step_us = 0; max_dt_us = 0; n_gap = 0; }
+
+  // true if getV() is backed by a running filter (otherwise it would just return 0)
+  bool hasV() { return (state.vel_up_valid && state.mode == 3) || state.baro_v_up_valid; }
+
+  // Static pressure [Pa] consistent with the filtered (baro + accelerometer) height, for reporting instead of the raw
+  // pressure. raw_pa: the current raw barometer pressure. The weather/QNH offset stays in raw_pa; only the filtered-minus-raw
+  // height difference is applied, via the ISA formula in ratio form, so a formula mismatch cancels and filtered == raw gives
+  // exactly raw_pa. Uses the baro-only ISA altitude - never the GNSS-corrected height, which would put GNSS height error
+  // into the "pressure". Returns false (use raw_pa) if the filter is not valid or disagrees with raw by more than 10 m.
+  bool getStaticPressure(float raw_pa, float* out_pa) {
+    if (!state.baro_isa_valid || !(raw_pa > 30000.0f && raw_pa < 110000.0f)) return false;
+    const float h_raw = baro_alt_pressure_to_altitude(raw_pa);
+    if (fabsf(state.baro_h_isa - h_raw) > 10.0f) return false;
+    *out_pa = raw_pa * powf((1.0f - state.baro_h_isa / 44330.0f) / (1.0f - h_raw / 44330.0f), 5.255f);
+    return true;
+  }
+
   const char* vSource() { return (state.vel_up_valid && state.mode == 3) ? "GNSS-INS" : (state.baro_v_up_valid ? "BARO-INS" : "none"); }
 
   // One-line orientation self-test string for printing (use your safe printer, e.g. mfSerial.printf("%s\n", buf)).
@@ -344,6 +444,8 @@ private:
   float acc_sum[3] = {0}, gyr_sum[3] = {0};
   uint32_t n_acc = 0;
   float dt_mean_us = 0;
+  float undulation_m = 0;   // geoid undulation (MSL - ellipsoid) from the last accepted GNSS fix
+  float home_h = 0;
 
   int64_t unwrap(uint32_t t) {
     if (!unwrap_init) { t_unwrapped = t; t_last32 = t; unwrap_init = true; return t_unwrapped; }
@@ -356,23 +458,29 @@ private:
 //---------------------------------------------------------------------------------
 // madflight AHR gizmo: lets INSLIB act as madflight's attitude estimator.
 //
-// Ahr::update() (called from imu_loop() at the IMU rate) calls AhrGizmoIns::update(), which feeds the raw IMU sample to
-// InsFusion and copies the INS quaternion into ahr.q. madflight then derives ahr.roll/pitch/yaw from it as usual, so the
-// rest of madflight (PID, logging, CLI 'pahr') sees the INSLIB attitude.
+// Ahr::update() (called from imu_loop() at the IMU rate) calls AhrGizmoIns::update(); afterwards madflight derives
+// ahr.roll/pitch/yaw from ahr.q as usual, so CLI 'pahr', logs and everything reading ahr.* see the INSLIB attitude.
 //
-// Use in main.cpp, AFTER madflight_setup() and AFTER insf.setup():
-//     ahr.gizmo = new AhrGizmoIns(&ahr, &insf);   // keep imu_loop() { ahr.update(); }
-// Do NOT also call insf.step() or start_task() in that case: the IMU samples would be fed twice.
+//   feed_samples = false (default, run mode A): the INS runs in its own task (insf.start_task); the gizmo only mirrors
+//                  the latest INS quaternion into ahr.q. No INS work happens inside imu_loop().
+//   feed_samples = true  (run mode B): the gizmo feeds every raw IMU sample to the INS right here, in the IMU task.
+//
+// Create it AFTER madflight_setup() and AFTER insf.setup():   ahr.gizmo = new AhrGizmoIns(&ahr, &insf [, true]);
 // The old gizmo is deliberately not deleted: the IMU task may be inside it right now.
 //---------------------------------------------------------------------------------
 class AhrGizmoIns : public AhrGizmo {
 public:
-  AhrGizmoIns(Ahr* ahr, InsFusion* ins) : ahr_(ahr), ins_(ins) {}
+  AhrGizmoIns(Ahr* ahr, InsFusion* ins, bool feed_samples = false) : ahr_(ahr), ins_(ins), feed_(feed_samples) {}
 
   bool update() override {
-    Imu* i = ahr_->config.pimu; // raw (calibrated, unfiltered) IMU sample
-    ins_->feed(i->ax, i->ay, i->az, i->gx, i->gy, i->gz, i->ts);
-    if (ins_->state.att_valid) for (int k = 0; k < 4; k++) ahr_->q[k] = ins_->state.q[k];
+    if (feed_) {
+      Imu* i = ahr_->config.pimu; // raw (calibrated, unfiltered) IMU sample
+      ins_->feed(i->ax, i->ay, i->az, i->gx, i->gy, i->gz, i->ts);
+      if (ins_->state.att_valid) for (int k = 0; k < 4; k++) ahr_->q[k] = ins_->state.q[k];
+    } else {
+      InsFusionState s; // consistent copy: the INS task publishes concurrently
+      if (ins_->topic.pull_latest(&s) && s.att_valid) for (int k = 0; k < 4; k++) ahr_->q[k] = s.q[k];
+    }
     return true;
   }
 
@@ -381,6 +489,7 @@ public:
 private:
   Ahr* ahr_;
   InsFusion* ins_;
+  bool feed_;
 };
 
 extern InsFusion insf; // define once in the sketch: InsFusion insf;
