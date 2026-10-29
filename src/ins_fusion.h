@@ -107,7 +107,7 @@ struct InsFusionConfig {
   float gnss_max_vel_acc_mps = 2.0f;
   float mag_year = 2026.8f;       // decimal year for the World Magnetic Model
   bool use_mag = true;
-  bool estimate_mag_bias = true;  // true: estimate the magnetometer hard-iron bias online (18-state mode). Does NOT replace
+  bool estimate_mag_bias = false;  // true: estimate the magnetometer hard-iron bias online (18-state mode). Does NOT replace
                                   // a proper calibration (soft-iron is not modelled), but reduces yaw error from a rough one.
                                   // Costs CPU: 18 instead of 15 filter states (worst-case epoch grows roughly with n^3).
 };
