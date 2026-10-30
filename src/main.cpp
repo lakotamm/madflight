@@ -64,7 +64,7 @@ extern "C" __attribute__((naked)) void isr_hardfault(void) {
 
 void overclock(){
   Serial.begin(115200);
-    delay(100);
+    delay(5000); // this must be 500 or more, otherwise weird things happen
 
     // Raise core voltage while still at 250 MHz.
     vreg_set_voltage(VREG_VOLTAGE_1_30);
